@@ -29,8 +29,8 @@ def load_dotenv(path: Path) -> None:
 
 load_dotenv(Path(__file__).with_name(".env"))
 
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
-MODEL = os.getenv("OLLAMA_MODEL", "llama3")
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/chat")
+MODEL = os.getenv("OLLAMA_MODEL", "qwen3:8b")
 
 ALLOWED_USER_ID_TEXT = os.getenv("BUBBLES_ALLOWED_USER_ID", "").strip()
 ALLOWED_USER_ID = int(ALLOWED_USER_ID_TEXT) if ALLOWED_USER_ID_TEXT.isdigit() else None
@@ -38,7 +38,8 @@ BOT_TOKEN = os.getenv("BUBBLES_BOT_TOKEN")
 GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID", "primary")
 GOOGLE_CREDENTIALS_PATH = Path(os.getenv("GOOGLE_CREDENTIALS_PATH", "credentials.json"))
 GOOGLE_TOKEN_PATH = Path(os.getenv("GOOGLE_TOKEN_PATH", "token.json"))
-GOOGLE_CALENDAR_TIMEZONE = os.getenv("GOOGLE_CALENDAR_TIMEZONE", "UTC")
+GOOGLE_CALENDAR_TIMEZONE = os.getenv("GOOGLE_CALENDAR_TIMEZONE", "America/Toronto")
+MEMORY_PATH = Path(os.getenv("BUBBLES_MEMORY_PATH", "memory.json"))
 CALENDAR_SCOPES = ["https://www.googleapis.com/auth/calendar.events"]
 REMINDER_MINUTES = [10, 30, 60, 24 * 60, 7 * 24 * 60]
 PENDING_EVENTS: dict[int, dict] = {}
@@ -91,6 +92,15 @@ NUMBER_WORDS = {
     "ten": 10,
     "fourteen": 14,
 }
+SMALL_NUMBER_WORDS = {
+    "a": 1,
+    "an": 1,
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+}
 WEEKDAYS = {
     "monday": 0,
     "mon": 0,
@@ -110,6 +120,60 @@ WEEKDAYS = {
     "sunday": 6,
     "sun": 6,
 }
+APPOINTMENT_TYPE_ALIASES = {
+    "dentist": "dental",
+    "dental": "dental",
+    "teeth": "dental",
+    "orthodontist": "dental",
+    "hair": "hair",
+    "haircut": "hair",
+    "hairstylist": "hair",
+    "barber": "hair",
+    "doctor": "doctor",
+    "physician": "doctor",
+    "medical": "doctor",
+    "gym": "gym",
+    "workout": "gym",
+    "school": "school",
+    "class": "school",
+}
+NO_REMINDER_PHRASES = {
+    "no",
+    "nah",
+    "nope",
+    "none",
+    "skip",
+    "no reminder",
+    "no reminders",
+    "don't remind me",
+    "dont remind me",
+    "do not remind me",
+    "that's okay",
+    "thats okay",
+    "that is okay",
+    "no thanks",
+    "no thank you",
+    "not needed",
+}
+YES_REMINDER_PHRASES = {
+    "yes",
+    "y",
+    "yeah",
+    "yep",
+    "sure",
+    "please",
+    "yes please",
+    "remind me",
+}
+SKIP_DESCRIPTION_PHRASES = {
+    "no",
+    "none",
+    "skip",
+    "nope",
+    "no description",
+    "no notes",
+    "nothing",
+}
 
 
 def is_authorized(update: Update) -> bool:
@@ -123,31 +187,184 @@ def remember_message(user_id: int, role: str, content: str) -> None:
     del history[:-10]
 
 
-def format_chat_prompt(user_id: int, user_input: str) -> str:
-    lines = [f"System: {SYSTEM_PROMPT}"]
+def load_memory() -> dict:
+    if not MEMORY_PATH.exists():
+        return {"appointment_defaults": {}}
+    try:
+        data = json.loads(MEMORY_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"appointment_defaults": {}}
+    if not isinstance(data, dict):
+        return {"appointment_defaults": {}}
+    data.setdefault("appointment_defaults", {})
+    return data
+
+
+def save_memory(data: dict) -> None:
+    data.setdefault("appointment_defaults", {})
+    MEMORY_PATH.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def appointment_type_from_text(value: str) -> str | None:
+    lowered = value.lower()
+    for alias, appointment_type in APPOINTMENT_TYPE_ALIASES.items():
+        if re.search(rf"\b{re.escape(alias)}\b", lowered):
+            return appointment_type
+    return None
+
+
+def clean_location_text(value: str) -> str:
+    cleaned = value.strip(" .")
+    cleaned = re.sub(
+        r"^(at|location is|it's at|it is at|please|pls)\s+",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\s+(is my usual|as my|for my|for the|location)\b.*$",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = cleaned.strip(" .")
+    if normalize_reply(cleaned) == "virtual":
+        return "Virtual"
+    return cleaned
+
+
+def normalize_reply(value: str) -> str:
+    lowered = value.strip().lower()
+    lowered = re.sub(r"[.!?]+$", "", lowered)
+    return re.sub(r"\s+", " ", lowered)
+
+
+def is_no_reminder_reply(value: str) -> bool:
+    normalized = normalize_reply(value)
+    if normalized in NO_REMINDER_PHRASES:
+        return True
+    if normalized.startswith(("nah", "no thanks", "no thank you")):
+        return True
+    return any(
+        phrase in normalized
+        for phrase in (
+            "no reminder",
+            "no reminders",
+            "don't remind",
+            "dont remind",
+            "do not remind",
+            "don't want to remind",
+            "dont want to remind",
+            "do not want to remind",
+            "that's okay",
+            "thats okay",
+        )
+    )
+
+
+def is_yes_reminder_without_details(value: str) -> bool:
+    return normalize_reply(value) in YES_REMINDER_PHRASES
+
+
+def is_skip_location_reply(value: str) -> bool:
+    return normalize_reply(value) in {"no", "none", "skip", "nope", "no location"}
+
+
+def is_skip_description_reply(value: str) -> bool:
+    return normalize_reply(value) in SKIP_DESCRIPTION_PHRASES
+
+
+def extract_location_reply(value: str, appointment_type: str | None) -> tuple[str, bool, str | None]:
+    lowered = normalize_reply(value)
+    if is_skip_location_reply(value):
+        return "", False, None
+
+    if lowered in {"same as usual", "usual", "normal location", "use my usual location"}:
+        location = usual_location_for_type(appointment_type)
+        return location, False, None
+
+    memory_fact = parse_memory_fact(value)
+    if memory_fact:
+        fact_type, location = memory_fact
+        return location, True, fact_type
+
+    at_match = re.search(r"\bat\s+(?P<location>.+)$", value.strip(), flags=re.IGNORECASE)
+    if at_match:
+        return clean_location_text(at_match.group("location")), False, None
+
+    return clean_location_text(value), False, None
+
+
+def appointment_defaults(appointment_type: str | None) -> dict:
+    if not appointment_type:
+        return {}
+    defaults = load_memory().get("appointment_defaults", {}).get(appointment_type, {})
+    return defaults if isinstance(defaults, dict) else {}
+
+
+def usual_location_for_type(appointment_type: str | None) -> str:
+    defaults = appointment_defaults(appointment_type)
+    return str(defaults.get("usual_location") or defaults.get("location") or "").strip()
+
+
+def update_appointment_default(appointment_type: str, key: str, value) -> None:
+    if not appointment_type or value in ("", None):
+        return
+    memory = load_memory()
+    defaults = memory.setdefault("appointment_defaults", {}).setdefault(appointment_type, {})
+    defaults[key] = value
+    if key == "location":
+        defaults["usual_location"] = value
+    save_memory(memory)
+
+
+def parse_memory_fact(value: str) -> tuple[str, str] | None:
+    text = value.strip()
+    patterns = [
+        r"(?P<location>.+?)\s+is\s+my\s+usual\s+(?P<kind>[a-z ]+?)\s+location\b",
+        r"(?:please\s+)?add\s+(?P<location>.+?)\s+as\s+my\s+(?P<kind>[a-z ]+?)\b",
+    ]
+    match = None
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            break
+    if not match:
+        return None
+    appointment_type = appointment_type_from_text(match.group("kind"))
+    location = clean_location_text(match.group("location"))
+    if not appointment_type or not location:
+        return None
+    return appointment_type, location
+
+
+def build_ollama_messages(user_id: int, user_input: str) -> list[dict[str, str]]:
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     for item in CHAT_MEMORY.get(user_id, []):
-        role = "User" if item["role"] == "user" else "Bubbles"
-        lines.append(f"{role}: {item['content']}")
-    lines.append(f"User: {user_input}")
-    lines.append("Bubbles:")
-    return "\n".join(lines)
+        role = item.get("role")
+        if role not in {"user", "assistant"}:
+            continue
+        messages.append({"role": role, "content": item.get("content", "")})
+    messages.append({"role": "user", "content": user_input})
+    return messages
 
 
 def ask_ollama(user_id: int, user_input: str) -> str:
-    prompt = format_chat_prompt(user_id, user_input)
+    messages = build_ollama_messages(user_id, user_input)
     try:
         response = requests.post(
             OLLAMA_URL,
             json={
                 "model": MODEL,
-                "prompt": prompt,
-                "stream": False
+                "messages": messages,
+                "stream": False,
             },
             timeout=120
         )
         response.raise_for_status()
         data = response.json()
-        return data.get("response", "No response from Ollama.")
+        message = data.get("message", {})
+        return message.get("content", "").strip() or "No response from Ollama."
     except Exception as e:
         return f"❌ Ollama error: {e}"
 
@@ -253,17 +470,47 @@ def event_start_text(event: dict) -> str:
     return start.get("dateTime") or start.get("date") or "unknown time"
 
 
+def parse_event_datetime(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo:
+        return parsed.astimezone(LOCAL_TZ).replace(tzinfo=None)
+    return parsed
+
+
+def format_event_for_telegram(event: dict) -> str:
+    title = event.get("summary", "(no title)")
+    lines = [f"📌 {title}"]
+    start = event.get("start", {})
+    end = event.get("end", {})
+    start_dt = parse_event_datetime(start.get("dateTime", ""))
+    end_dt = parse_event_datetime(end.get("dateTime", ""))
+    if start_dt:
+        lines.append(f"🗓️ {start_dt.strftime('%A')}, {start_dt.strftime('%B')} {start_dt.day}")
+        if end_dt:
+            lines.append(f"⏰ {format_local_clock(start_dt.strftime('%H:%M'))} - {format_local_clock(end_dt.strftime('%H:%M'))}")
+        else:
+            lines.append(f"⏰ {format_local_clock(start_dt.strftime('%H:%M'))}")
+    elif start.get("date"):
+        try:
+            date_only = datetime.fromisoformat(start["date"])
+            lines.append(f"🗓️ {date_only.strftime('%A')}, {date_only.strftime('%B')} {date_only.day}")
+        except ValueError:
+            lines.append(f"🗓️ {start['date']}")
+    if event.get("location"):
+        lines.append(f"📍 {event['location']}")
+    return "\n".join(lines)
+
+
 def format_calendar_events(events: list[dict], empty_message: str = "No upcoming events found.") -> str:
     if not events:
         return empty_message
 
-    lines = []
-    for event in events:
-        title = event.get("summary", "(no title)")
-        location = event.get("location", "")
-        suffix = f" — {location}" if location else ""
-        lines.append(f"- {event_start_text(event)}: {title}{suffix}")
-    return "\n".join(lines)
+    return "\n\n".join(format_event_for_telegram(event) for event in events)
 
 
 def parse_calendar_date(value: str) -> tuple[dict, dict]:
@@ -285,8 +532,8 @@ def parse_calendar_date(value: str) -> tuple[dict, dict]:
         raise ValueError("Use YYYY-MM-DD, YYYY-MM-DD HH:MM, or YYYY-MM-DDTHH:MM.")
 
     end = start + timedelta(hours=1)
-    start_value = {"dateTime": start.isoformat(), "timeZone": GOOGLE_CALENDAR_TIMEZONE}
-    end_value = {"dateTime": end.isoformat(), "timeZone": GOOGLE_CALENDAR_TIMEZONE}
+    start_value = {"dateTime": start.replace(tzinfo=None).isoformat(), "timeZone": GOOGLE_CALENDAR_TIMEZONE}
+    end_value = {"dateTime": end.replace(tzinfo=None).isoformat(), "timeZone": GOOGLE_CALENDAR_TIMEZONE}
     return start_value, end_value
 
 
@@ -344,7 +591,11 @@ def parse_human_date(value: str) -> str | None:
 
 def parse_human_time(value: str) -> str | None:
     text = value.strip().lower()
-    am_pm = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b", text)
+    text = text.replace("a.m.", "am").replace("a.m", "am")
+    text = text.replace("p.m.", "pm").replace("p.m", "pm")
+    text = re.sub(r"\ba\s*\.?\s*m\.?\b", "am", text)
+    text = re.sub(r"\bp\s*\.?\s*m\.?\b", "pm", text)
+    am_pm = re.search(r"\b(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b", text)
     if am_pm:
         hour = int(am_pm.group(1))
         minute = int(am_pm.group(2) or "0")
@@ -356,11 +607,91 @@ def parse_human_time(value: str) -> str | None:
         if 0 <= hour <= 23 and 0 <= minute <= 59:
             return f"{hour:02d}:{minute:02d}"
 
+    evening = re.search(r"\b(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s+in\s+the\s+(evening|afternoon|morning)\b", text)
+    if evening:
+        hour = int(evening.group(1))
+        minute = int(evening.group(2) or "0")
+        period = evening.group(3)
+        if period in {"evening", "afternoon"} and hour < 12:
+            hour += 12
+        if period == "morning" and hour == 12:
+            hour = 0
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return f"{hour:02d}:{minute:02d}"
+
     twenty_four = re.search(r"\b([01]?\d|2[0-3]):([0-5]\d)\b", text)
     if twenty_four:
         return f"{int(twenty_four.group(1)):02d}:{int(twenty_four.group(2)):02d}"
 
+    at_hour = re.search(r"\bat\s+(\d{1,2})\b", text)
+    if at_hour:
+        hour = int(at_hour.group(1))
+        if 1 <= hour <= 23:
+            return f"{hour:02d}:00"
+
     return None
+
+
+def format_local_event_time(date_text: str, time_text: str) -> str:
+    start = datetime.fromisoformat(f"{date_text}T{time_text}")
+    month = start.strftime("%B")
+    day = start.day
+    hour = start.strftime("%I").lstrip("0")
+    minute = start.strftime("%M")
+    marker = start.strftime("%p")
+    return f"{month} {day} at {hour}:{minute} {marker}"
+
+
+def format_local_event_date(date_text: str) -> str:
+    start = datetime.fromisoformat(date_text)
+    return f"{start.strftime('%A')}, {start.strftime('%B')} {start.day}"
+
+
+def format_local_clock(time_text: str) -> str:
+    start = datetime.fromisoformat(f"2000-01-01T{time_text}")
+    return f"{start.strftime('%I').lstrip('0')}:{start.strftime('%M')} {start.strftime('%p')}"
+
+
+def format_reminder_offsets(offsets: list[int]) -> str:
+    labels = []
+    for minutes in offsets:
+        if minutes % 1440 == 0:
+            amount = minutes // 1440
+            labels.append("1 day before" if amount == 1 else f"{amount} days before")
+        elif minutes % 60 == 0:
+            amount = minutes // 60
+            labels.append("1 hour before" if amount == 1 else f"{amount} hours before")
+        else:
+            labels.append(f"{minutes} minutes before")
+    return ", ".join(labels) if labels else "No reminders"
+
+
+def appointment_icon(appointment_type: str | None) -> str:
+    icons = {
+        "dental": "🦷",
+        "hair": "💇",
+        "doctor": "🩺",
+        "gym": "🏋️",
+        "school": "🎓",
+    }
+    return icons.get(appointment_type or "", "📌")
+
+
+def event_confirmation_text(event: dict, fallback_title: str, draft: dict) -> str:
+    title = event.get("summary", fallback_title)
+    lines = ["✅ Calendar event added", "", f"{appointment_icon(draft.get('appointment_type'))} {title}"]
+    if draft.get("location"):
+        lines.append(f"📍 {draft['location']}")
+    if draft.get("date"):
+        lines.append(f"🗓️ {format_local_event_date(draft['date'])}")
+    if draft.get("time"):
+        start_time = format_local_clock(draft["time"])
+        end_dt = datetime.fromisoformat(f"{draft['date']}T{draft['time']}") + timedelta(
+            minutes=int(draft.get("duration_minutes", 60))
+        )
+        lines.append(f"⏰ {start_time} - {format_local_clock(end_dt.strftime('%H:%M'))}")
+    lines.append(f"🔔 {format_reminder_offsets(list(draft.get('reminder_offsets', [])))}")
+    return "\n".join(lines)
 
 
 def parse_duration_minutes(value: str) -> int | None:
@@ -378,6 +709,75 @@ def parse_duration_minutes(value: str) -> int | None:
     if "hour" in text:
         return 60
     return None
+
+
+def number_text_to_int(value: str) -> int | None:
+    lowered = value.strip().lower()
+    if lowered.isdigit():
+        return int(lowered)
+    return SMALL_NUMBER_WORDS.get(lowered)
+
+
+def parse_reminder_offsets(value: str) -> tuple[list[int], bool]:
+    text = value.strip().lower()
+    if is_no_reminder_reply(value):
+        return [], False
+
+    normalized = re.sub(r"\bmins?\b", "minutes", text)
+    normalized = re.sub(r"\bhrs?\b", "hours", normalized)
+    offsets: list[int] = []
+
+    pattern = re.compile(
+        r"\b(?P<count>\d+|one|two|three|four|five|a|an)\s+"
+        r"(?P<unit>minutes?|hours?|days?)\b"
+    )
+    for match in pattern.finditer(normalized):
+        count = number_text_to_int(match.group("count"))
+        if count is None:
+            continue
+        unit = match.group("unit")
+        if unit.startswith("minute"):
+            minutes = count
+        elif unit.startswith("hour"):
+            minutes = count * 60
+        elif unit.startswith("day"):
+            minutes = count * 24 * 60
+        else:
+            continue
+        if minutes not in offsets:
+            offsets.append(minutes)
+
+    bare_units = (
+        ("day before", 24 * 60),
+        ("hour before", 60),
+    )
+    for phrase, minutes in bare_units:
+        if phrase in normalized and minutes not in offsets:
+            offsets.append(minutes)
+
+    return offsets[:5], len(offsets) > 5
+
+
+def parse_requested_reminder_count(value: str) -> int | None:
+    text = value.strip().lower()
+    match = re.search(r"\b(\d+|one|two|three|four|five)\b", text)
+    if not match:
+        return None
+    count = number_text_to_int(match.group(1))
+    if count is None:
+        return None
+    return max(1, min(count, 5))
+
+
+def reminder_count_label(count: int) -> str:
+    labels = {
+        1: "one",
+        2: "two",
+        3: "three",
+        4: "four",
+        5: "five",
+    }
+    return labels.get(count, str(count))
 
 
 def parse_days_from_text(value: str, default: int = 7) -> int:
@@ -440,16 +840,92 @@ def extract_event_request(value: str) -> dict | None:
         title = title_case_event(match.group("title"))
         date_phrase = match.group("date").strip()
     else:
-        title = ""
+        title_text = re.sub(
+            r"\b(can you|please|could you|would you|i need to|i want to)?\s*"
+            r"(schedule|create|add|book|set up)\s+(a|an|new)?\s*",
+            "",
+            value,
+            flags=re.IGNORECASE,
+        )
+        title_text = re.sub(r"\?$", "", title_text).strip()
+        title = title_case_event(title_text) if appointment_type_from_text(title_text) else ""
         date_phrase = value
+    appointment_type = appointment_type_from_text(title or value)
+    if not title and appointment_type:
+        title = f"{appointment_type.title()} appointment"
 
     return {
         "title": title,
+        "appointment_type": appointment_type,
         "date": parse_human_date(date_phrase),
         "time": parse_human_time(date_phrase),
         "duration_minutes": parse_duration_minutes(value),
         "location": "",
     }
+
+
+def apply_saved_defaults(draft: dict) -> list[str]:
+    notes = []
+    defaults = appointment_defaults(draft.get("appointment_type"))
+    if not defaults:
+        return notes
+
+    default_location = usual_location_for_type(draft.get("appointment_type"))
+    if not draft.get("location") and default_location:
+        draft["location"] = default_location
+        draft["location_from_default"] = True
+        notes.append(f"Using {default_location} as your usual {draft['appointment_type']} location.")
+
+    if not draft.get("duration_minutes") and defaults.get("duration_minutes"):
+        draft["duration_minutes"] = int(defaults["duration_minutes"])
+        draft["duration_from_default"] = True
+
+    if "reminder_offsets" not in draft and defaults.get("reminder_offsets") is not None:
+        draft["reminder_offsets"] = list(defaults["reminder_offsets"])[:5]
+        draft["wants_reminders"] = bool(draft["reminder_offsets"])
+        draft["reminder_count"] = str(len(draft["reminder_offsets"]))
+        draft["reminders_from_default"] = True
+
+    return notes
+
+
+def next_event_step(draft: dict) -> str:
+    if not draft.get("title"):
+        return "title"
+    if not draft.get("date"):
+        return "date"
+    if not draft.get("time"):
+        return "time"
+    if not draft.get("duration_minutes"):
+        return "duration"
+    if not draft.get("location") and not draft.get("location_skipped"):
+        return "location"
+    if "reminder_offsets" not in draft:
+        return "reminders"
+    return "description"
+
+
+def step_question(step: str) -> str:
+    questions = {
+        "title": "Sure. What should I call the appointment?",
+        "date": "What date should that be?",
+        "time": "What time should it start?",
+        "duration": "How long should it be?",
+        "location": "Any location for it?",
+        "reminders": "Do you want any reminders?",
+        "description": "Any description you want to add?",
+    }
+    return questions.get(step, "What else should I know?")
+
+
+def reset_field_retries(draft: dict, step: str) -> None:
+    draft.setdefault("retries", {})[step] = 0
+
+
+def retry_prompt(draft: dict, step: str, default_message: str, clearer_message: str) -> str:
+    retries = draft.setdefault("retries", {})
+    retries[step] = retries.get(step, 0) + 1
+    return clearer_message if retries[step] >= 2 else default_message
 
 
 def parse_reminder_choice(value: str) -> bool:
@@ -480,6 +956,16 @@ def build_event_reminders(wants_reminders: bool, count_text: str) -> dict:
     }
 
 
+def build_event_reminders_from_offsets(offsets: list[int]) -> dict:
+    return {
+        "useDefault": False,
+        "overrides": [
+            {"method": "popup", "minutes": minutes}
+            for minutes in offsets[:5]
+        ],
+    }
+
+
 def create_calendar_event(
     title: str,
     date_text: str,
@@ -488,6 +974,7 @@ def create_calendar_event(
     description: str = "",
     duration_minutes: int = 60,
     location: str = "",
+    reminder_offsets: list[int] | None = None,
 ) -> dict:
     service = get_calendar_service()
     start, end = parse_calendar_date(date_text)
@@ -500,7 +987,11 @@ def create_calendar_event(
         "summary": title.strip(),
         "start": start,
         "end": end,
-        "reminders": build_event_reminders(wants_reminders, reminder_count_text),
+        "reminders": (
+            build_event_reminders_from_offsets(reminder_offsets)
+            if reminder_offsets is not None
+            else build_event_reminders(wants_reminders, reminder_count_text)
+        ),
     }
     if description.strip():
         event["description"] = description.strip()
@@ -750,12 +1241,25 @@ async def send_text(update: Update, text: str, remember: bool = True) -> None:
         remember_message(user.id, "assistant", text[:4000])
 
 
+async def ask_next_event_question(update: Update, draft: dict, notes: list[str] | None = None) -> None:
+    user = update.effective_user
+    if user is None:
+        return
+    step = next_event_step(draft)
+    draft["step"] = step
+    reset_field_retries(draft, step)
+    PENDING_EVENTS[user.id] = draft
+    prefix = " ".join(notes or [])
+    question = step_question(step)
+    await send_text(update, f"{prefix} {question}".strip())
+
+
 async def continue_event_draft(update: Update, user_input: str) -> bool:
     user = update.effective_user
     if user is None or user.id not in PENDING_EVENTS:
         return False
 
-    lowered = user_input.strip().lower()
+    lowered = normalize_reply(user_input)
     if lowered in {"cancel", "stop", "never mind", "nevermind"}:
         PENDING_EVENTS.pop(user.id, None)
         await send_text(update, "Canceled the calendar event.")
@@ -768,78 +1272,169 @@ async def continue_event_draft(update: Update, user_input: str) -> bool:
         if step == "title":
             title = title_case_event(user_input)
             if not title:
-                await send_text(update, "What should I call the appointment?")
+                await send_text(update, retry_prompt(draft, step, "What should I call the appointment?", "Please send a short title, like Bingo or Dentist appointment."))
                 return True
             draft["title"] = title
-            draft["step"] = "date"
-            await send_text(update, "What date should that be?")
+            draft["appointment_type"] = appointment_type_from_text(title)
+            notes = apply_saved_defaults(draft)
+            await ask_next_event_question(update, draft, notes)
             return True
 
         if step == "date":
             parsed_date = parse_human_date(user_input)
             if not parsed_date:
-                await send_text(update, "What date should that be? For example: tomorrow, next Friday, or April 25.")
+                await send_text(update, retry_prompt(draft, step, "What date should that be? For example: tomorrow, next Friday, or April 25.", "Please send a date like tomorrow, next Friday, or April 25."))
                 return True
             draft["date"] = parsed_date
-            draft["step"] = "time"
-            await send_text(update, "What time should it start?")
+            await ask_next_event_question(update, draft)
             return True
 
         if step == "time":
             parsed_time = parse_human_time(user_input)
             if not parsed_time:
-                await send_text(update, "What time should it start? For example: 2pm or 14:30.")
+                await send_text(update, retry_prompt(draft, step, "What time should it start? For example: 2pm or 14:30.", "Please send a start time like 6 p.m., 2pm, or 14:30."))
                 return True
             draft["time"] = parsed_time
-            draft["step"] = "duration"
-            await send_text(update, "How long should it be? You can say 30 minutes or 1 hour.")
+            await ask_next_event_question(update, draft)
             return True
 
         if step == "duration":
             duration = parse_duration_minutes(user_input)
             if duration is None:
-                await send_text(update, "How long should it be? For example: 30 minutes or 1 hour.")
+                await send_text(update, retry_prompt(draft, step, "How long should it be? For example: 30 minutes or 1 hour.", "Please send a duration like 30 minutes or 2 hours."))
                 return True
             draft["duration_minutes"] = duration
-            draft["step"] = "location"
-            await send_text(update, "Any location for it?")
+            update_appointment_default(str(draft.get("appointment_type", "")), "duration_minutes", duration)
+            await ask_next_event_question(update, draft)
             return True
 
         if step == "location":
-            draft["location"] = "" if lowered in {"no", "none", "skip", "nope"} else user_input.strip()
-            draft["step"] = "reminders"
-            await send_text(update, "Do you want any reminders?")
+            location, should_save, fact_type = extract_location_reply(user_input, draft.get("appointment_type"))
+            if lowered in {"same as usual", "usual", "normal location", "use my usual location"} and not location:
+                await send_text(update, retry_prompt(draft, step, "I don't have a usual location saved for this yet. What's the location?", "Send a location like Virtual or Scottsdale Dental, or say skip."))
+                return True
+
+            if fact_type and not draft.get("appointment_type"):
+                draft["appointment_type"] = fact_type
+            appointment_type = str(fact_type or draft.get("appointment_type", ""))
+            draft["location"] = location
+            draft["location_skipped"] = not bool(location)
+            if location and (should_save or appointment_type):
+                update_appointment_default(appointment_type, "location", location)
+
+            note = []
+            if should_save and location and appointment_type:
+                note.append(f"Using {location} as your usual {appointment_type} location.")
+            await ask_next_event_question(update, draft, note)
             return True
 
         if step == "reminders":
-            try:
-                wants_reminders = parse_reminder_choice(user_input)
-            except ValueError:
-                await send_text(update, "Do you want any reminders? Please answer yes or no.")
+            if lowered in {"same as usual", "use my normal reminders", "normal reminders", "usual reminders"}:
+                defaults = appointment_defaults(draft.get("appointment_type"))
+                if defaults.get("reminder_offsets") is None:
+                    await send_text(update, retry_prompt(draft, step, "I don't have usual reminders saved for this yet. When should I remind you?", "Send reminder times like 30 minutes before, or say no reminders."))
+                    return True
+                draft["reminder_offsets"] = list(defaults.get("reminder_offsets", []))[:5]
+                draft["wants_reminders"] = bool(draft["reminder_offsets"])
+                draft["reminder_count"] = str(len(draft["reminder_offsets"]))
+                await ask_next_event_question(update, draft)
                 return True
-            draft["wants_reminders"] = wants_reminders
-            if wants_reminders:
-                draft["step"] = "reminder_count"
-                await send_text(update, "How many reminders do you want?")
-            else:
+
+            offsets, was_limited = parse_reminder_offsets(user_input)
+            if offsets:
+                draft["reminder_offsets"] = offsets
+                draft["wants_reminders"] = True
+                draft["reminder_count"] = str(len(offsets))
+                update_appointment_default(str(draft.get("appointment_type", "")), "reminder_offsets", offsets)
+                suffix = " I can use up to 5, so I kept the first 5." if was_limited else ""
+                await ask_next_event_question(update, draft, [f"Got it.{suffix}"])
+                return True
+
+            if is_yes_reminder_without_details(user_input):
+                draft["wants_reminders"] = True
+                draft["step"] = "reminder_times"
+                reset_field_retries(draft, "reminder_times")
+                await send_text(update, "Sure — when should I remind you?")
+                return True
+
+            if is_no_reminder_reply(user_input):
+                draft["reminder_offsets"] = []
+                draft["wants_reminders"] = False
                 draft["reminder_count"] = "0"
-                draft["step"] = "description"
-                await send_text(update, "Any description you want to add?")
+                update_appointment_default(str(draft.get("appointment_type", "")), "reminder_offsets", [])
+                await ask_next_event_question(update, draft)
+                return True
+
+            await send_text(update, retry_prompt(draft, step, "When should I remind you? For example: 30 minutes before, or 1 day before.", "Send reminder times like 10 min before, or say no reminders."))
+            return True
+
+        if step == "reminder_times":
+            if is_no_reminder_reply(user_input):
+                draft["reminder_offsets"] = []
+                draft["wants_reminders"] = False
+                draft["reminder_count"] = "0"
+                update_appointment_default(str(draft.get("appointment_type", "")), "reminder_offsets", [])
+                await ask_next_event_question(update, draft)
+                return True
+
+            offsets, was_limited = parse_reminder_offsets(user_input)
+            if not offsets:
+                await send_text(update, retry_prompt(draft, step, "What reminder times should I use? For example: 30 minutes before and 1 day before.", "Send reminder times like 10 min before, or say no reminders."))
+                return True
+            draft["reminder_offsets"] = offsets
+            draft["reminder_count"] = str(len(offsets))
+            update_appointment_default(str(draft.get("appointment_type", "")), "reminder_offsets", offsets)
+            suffix = " I can use up to 5, so I kept the first 5." if was_limited else ""
+            await ask_next_event_question(update, draft, [f"Got it.{suffix}"])
             return True
 
         if step == "reminder_count":
-            try:
-                int(user_input.strip())
-            except ValueError:
-                await send_text(update, "How many reminders do you want? Send a number from 1 to 5.")
+            if is_no_reminder_reply(user_input):
+                draft["reminder_offsets"] = []
+                draft["wants_reminders"] = False
+                draft["reminder_count"] = "0"
+                update_appointment_default(str(draft.get("appointment_type", "")), "reminder_offsets", [])
+                await ask_next_event_question(update, draft)
                 return True
-            draft["reminder_count"] = user_input.strip()
-            draft["step"] = "description"
-            await send_text(update, "Any description you want to add?")
+
+            offsets, was_limited = parse_reminder_offsets(user_input)
+            if offsets:
+                draft["reminder_offsets"] = offsets
+                draft["wants_reminders"] = True
+                draft["reminder_count"] = str(len(offsets))
+                update_appointment_default(str(draft.get("appointment_type", "")), "reminder_offsets", offsets)
+                suffix = " I can use up to 5, so I kept the first 5." if was_limited else ""
+                await ask_next_event_question(update, draft, [f"Got it.{suffix}"])
+                return True
+
+            count = parse_requested_reminder_count(user_input)
+            if count is None:
+                await send_text(update, retry_prompt(draft, step, "What reminder times should I use? For example: 10 minutes and 1 day before.", "Send reminder times like 10 min before, or say no reminders."))
+                return True
+            draft["wants_reminders"] = True
+            draft["requested_reminder_count"] = count
+            draft["step"] = "reminder_times"
+            label = "reminder time" if count == 1 else "reminder times"
+            await send_text(update, f"Got it. What should the {reminder_count_label(count)} {label} be?")
             return True
 
         if step == "description":
-            description = "" if lowered in {"no", "none", "skip", "nope"} else user_input.strip()
+            memory_fact = parse_memory_fact(user_input)
+            if memory_fact:
+                fact_type, location = memory_fact
+                draft["appointment_type"] = draft.get("appointment_type") or fact_type
+                draft["location"] = location
+                update_appointment_default(fact_type, "location", location)
+                description = ""
+            elif re.search(r"\bat\s+.+", user_input, flags=re.IGNORECASE) and not re.search(
+                r"\b(description|note|notes|details)\b", user_input, flags=re.IGNORECASE
+            ):
+                location, _, _ = extract_location_reply(user_input, draft.get("appointment_type"))
+                if location:
+                    draft["location"] = location
+                description = ""
+            else:
+                description = "" if is_skip_description_reply(user_input) else user_input.strip()
             date_text = f"{draft['date']} {draft['time']}"
             event = create_calendar_event(
                 draft["title"],
@@ -849,12 +1444,12 @@ async def continue_event_draft(update: Update, user_input: str) -> bool:
                 description,
                 int(draft.get("duration_minutes", 60)),
                 str(draft.get("location", "")),
+                list(draft.get("reminder_offsets", [])),
             )
             PENDING_EVENTS.pop(user.id, None)
             await send_text(
                 update,
-                "✅ Calendar event added\n\n"
-                f"{event_start_text(event)}: {event.get('summary', draft['title'])}"
+                event_confirmation_text(event, draft["title"], draft)
             )
             return True
     except Exception as e:
@@ -872,44 +1467,14 @@ async def start_event_draft(update: Update, request: dict) -> None:
 
     draft = {
         "title": request["title"],
+        "appointment_type": request.get("appointment_type"),
         "date": request.get("date"),
         "time": request.get("time"),
         "duration_minutes": request.get("duration_minutes"),
         "location": request.get("location", ""),
     }
-    if not draft["title"]:
-        draft["step"] = "title"
-        PENDING_EVENTS[user.id] = draft
-        await send_text(update, "Sure. What should I call the appointment?")
-        return
-
-    if not draft["date"]:
-        draft["step"] = "date"
-        PENDING_EVENTS[user.id] = draft
-        await send_text(update, "What date should that be?")
-        return
-
-    if not draft["time"]:
-        draft["step"] = "time"
-        PENDING_EVENTS[user.id] = draft
-        await send_text(update, "What time should it start?")
-        return
-
-    if not draft["duration_minutes"]:
-        draft["step"] = "duration"
-        PENDING_EVENTS[user.id] = draft
-        await send_text(update, "How long should it be?")
-        return
-
-    if not draft["location"]:
-        draft["step"] = "location"
-        PENDING_EVENTS[user.id] = draft
-        await send_text(update, "Any location for it?")
-        return
-
-    draft["step"] = "reminders"
-    PENDING_EVENTS[user.id] = draft
-    await send_text(update, "Do you want any reminders?")
+    notes = apply_saved_defaults(draft)
+    await ask_next_event_question(update, draft, notes)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -934,6 +1499,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
+        memory_fact = parse_memory_fact(user_input)
+        if memory_fact:
+            appointment_type, location = memory_fact
+            update_appointment_default(appointment_type, "location", location)
+            remember_message(user.id, "user", user_input)
+            await send_text(update, f"Got it — I'll remember {location} for {appointment_type} appointments.")
+            return
+
         event_request = extract_event_request(user_input)
         if event_request:
             remember_message(user.id, "user", user_input)
@@ -996,7 +1569,7 @@ def main():
     app.add_handler(CommandHandler("write", write_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("🤖 Bubbles (@bubbles_sys_bot) is running...")
+    print(f"🤖 Bubbles (@bubbles_sys_bot) is running with Ollama model {MODEL} at {OLLAMA_URL}.")
     app.run_polling()
 
 

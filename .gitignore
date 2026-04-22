@@ -1,5 +1,6 @@
 .env
 credentials.json
 token.json
+memory.json
 __pycache__/
 *.pyc
