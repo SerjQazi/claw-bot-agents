@@ -29,7 +29,17 @@ def load_dotenv(path: Path) -> None:
 
 load_dotenv(Path(__file__).with_name(".env"))
 
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/chat")
+DEFAULT_OLLAMA_URL = "http://localhost:11434/api/chat"
+
+
+def ollama_chat_url(value: str | None) -> str:
+    url = (value or DEFAULT_OLLAMA_URL).strip() or DEFAULT_OLLAMA_URL
+    if url.rstrip("/").endswith("/api/generate"):
+        return url.rstrip("/")[: -len("/api/generate")] + "/api/chat"
+    return url
+
+
+OLLAMA_URL = ollama_chat_url(os.getenv("OLLAMA_URL"))
 MODEL = os.getenv("OLLAMA_MODEL", "qwen3:8b")
 
 ALLOWED_USER_ID_TEXT = os.getenv("BUBBLES_ALLOWED_USER_ID", "").strip()
@@ -40,6 +50,7 @@ GOOGLE_CREDENTIALS_PATH = Path(os.getenv("GOOGLE_CREDENTIALS_PATH", "credentials
 GOOGLE_TOKEN_PATH = Path(os.getenv("GOOGLE_TOKEN_PATH", "token.json"))
 GOOGLE_CALENDAR_TIMEZONE = os.getenv("GOOGLE_CALENDAR_TIMEZONE", "America/Toronto")
 MEMORY_PATH = Path(os.getenv("BUBBLES_MEMORY_PATH", "memory.json"))
+BUBBLES_ENABLE_DEV_COMMANDS = os.getenv("BUBBLES_ENABLE_DEV_COMMANDS", "").strip().lower() in {"1", "true", "yes", "on"}
 CALENDAR_SCOPES = ["https://www.googleapis.com/auth/calendar.events"]
 REMINDER_MINUTES = [10, 30, 60, 24 * 60, 7 * 24 * 60]
 PENDING_EVENTS: dict[int, dict] = {}
@@ -503,7 +514,27 @@ def format_event_for_telegram(event: dict) -> str:
             lines.append(f"🗓️ {start['date']}")
     if event.get("location"):
         lines.append(f"📍 {event['location']}")
-    return "\n".join(lines)
+    reminder_text = format_event_reminders(event)
+    if reminder_text:
+        lines.append(f"🔔 {reminder_text}")
+    return "\n\n".join(lines)
+
+
+def format_event_reminders(event: dict) -> str:
+    reminders = event.get("reminders", {})
+    if not isinstance(reminders, dict):
+        return ""
+    overrides = reminders.get("overrides")
+    if not isinstance(overrides, list):
+        return ""
+    offsets = []
+    for reminder in overrides:
+        if not isinstance(reminder, dict):
+            continue
+        minutes = reminder.get("minutes")
+        if isinstance(minutes, int):
+            offsets.append(minutes)
+    return format_reminder_offsets(offsets) if offsets else "No reminders"
 
 
 def format_calendar_events(events: list[dict], empty_message: str = "No upcoming events found.") -> str:
@@ -679,9 +710,7 @@ def appointment_icon(appointment_type: str | None) -> str:
 
 def event_confirmation_text(event: dict, fallback_title: str, draft: dict) -> str:
     title = event.get("summary", fallback_title)
-    lines = ["✅ Calendar event added", "", f"{appointment_icon(draft.get('appointment_type'))} {title}"]
-    if draft.get("location"):
-        lines.append(f"📍 {draft['location']}")
+    lines = ["✅ Event added", "", f"{appointment_icon(draft.get('appointment_type'))} {title}"]
     if draft.get("date"):
         lines.append(f"🗓️ {format_local_event_date(draft['date'])}")
     if draft.get("time"):
@@ -690,15 +719,29 @@ def event_confirmation_text(event: dict, fallback_title: str, draft: dict) -> st
             minutes=int(draft.get("duration_minutes", 60))
         )
         lines.append(f"⏰ {start_time} - {format_local_clock(end_dt.strftime('%H:%M'))}")
+    if draft.get("location"):
+        lines.append(f"📍 {draft['location']}")
     lines.append(f"🔔 {format_reminder_offsets(list(draft.get('reminder_offsets', [])))}")
-    return "\n".join(lines)
+    return "\n\n".join(lines)
 
 
 def parse_duration_minutes(value: str) -> int | None:
     text = value.strip().lower()
+    fine_match = re.search(r"\b(one|two|three|four|five|\d+(?:\.\d+)?)\s+hours?\s+is\s+fine\b", text)
+    if fine_match:
+        amount_text = fine_match.group(1)
+        amount = number_text_to_int(amount_text)
+        if amount is None:
+            amount = int(float(amount_text))
+        return max(1, int(amount * 60))
+
     hour_match = re.search(r"\b(\d+(?:\.\d+)?)\s*(?:hours?|hrs?|h)\b", text)
     if hour_match:
         return max(1, int(float(hour_match.group(1)) * 60))
+
+    word_hour_match = re.search(r"\b(one|two|three|four|five)\s+hours?\b", text)
+    if word_hour_match:
+        return int(number_text_to_int(word_hour_match.group(1)) * 60)
 
     minute_match = re.search(r"\b(\d{1,3})\s*(?:minutes?|mins?|m)\b", text)
     if minute_match:
@@ -708,6 +751,30 @@ def parse_duration_minutes(value: str) -> int | None:
         return 30
     if "hour" in text:
         return 60
+    return None
+
+
+def parse_event_duration_minutes(value: str) -> int | None:
+    text = value.strip().lower()
+    text = re.sub(r"\bmins?\b", "minutes", text)
+    text = re.sub(r"\bhrs?\b", "hours", text)
+    patterns = [
+        r"\bfor\s+(?P<count>\d+(?:\.\d+)?|one|two|three|four|five)\s*(?P<unit>minutes?|hours?)\b",
+        r"\b(?:lasts?|take|takes)\s+(?P<count>\d+(?:\.\d+)?|one|two|three|four|five)\s*(?P<unit>minutes?|hours?)\b",
+        r"\b(?P<count>\d+(?:\.\d+)?|one|two|three|four|five)\s*(?P<unit>minutes?|hours?)\s+is\s+fine\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if not match:
+            continue
+        count_text = match.group("count")
+        count = number_text_to_int(count_text)
+        if count is None:
+            count = float(count_text)
+        unit = match.group("unit")
+        if unit.startswith("hour"):
+            return max(1, int(count * 60))
+        return max(1, int(count))
     return None
 
 
@@ -725,6 +792,11 @@ def parse_reminder_offsets(value: str) -> tuple[list[int], bool]:
 
     normalized = re.sub(r"\bmins?\b", "minutes", text)
     normalized = re.sub(r"\bhrs?\b", "hours", normalized)
+    normalized = re.sub(
+        r"\bfor\s+(?:\d+(?:\.\d+)?|one|two|three|four|five|a|an)\s+(?:minutes?|hours?)\b",
+        "",
+        normalized,
+    )
     offsets: list[int] = []
 
     pattern = re.compile(
@@ -830,6 +902,8 @@ def extract_event_request(value: str) -> dict | None:
     if not is_schedule_intent(value):
         return None
 
+    slots = extract_schedule_slots(value)
+
     match = re.search(
         r"\b(?:create|schedule|add|book|put)\s+(?P<title>.+?)\s+(?:for|on)\s+(?P<date>.+)$",
         value,
@@ -850,18 +924,130 @@ def extract_event_request(value: str) -> dict | None:
         title_text = re.sub(r"\?$", "", title_text).strip()
         title = title_case_event(title_text) if appointment_type_from_text(title_text) else ""
         date_phrase = value
-    appointment_type = appointment_type_from_text(title or value)
+    appointment_type = slots.get("appointment_type") or appointment_type_from_text(title or value)
+    if appointment_type and re.search(r"\b(today|tomorrow|next|at\s+\d|\d{1,2}:\d{2}|am|pm|for\s+\d|for\s+one|remind)\b", title, re.IGNORECASE):
+        title = f"{appointment_type.title()} appointment"
     if not title and appointment_type:
         title = f"{appointment_type.title()} appointment"
 
     return {
         "title": title,
         "appointment_type": appointment_type,
-        "date": parse_human_date(date_phrase),
-        "time": parse_human_time(date_phrase),
-        "duration_minutes": parse_duration_minutes(value),
-        "location": "",
+        "date": slots.get("date") or parse_human_date(date_phrase),
+        "time": slots.get("time") or parse_human_time(date_phrase),
+        "duration_minutes": slots.get("duration_minutes") or parse_duration_minutes(value),
+        "location": slots.get("location", ""),
+        "location_skipped": slots.get("location_skipped", False),
+        "reminder_offsets": slots.get("reminder_offsets"),
+        "wants_reminders": slots.get("wants_reminders"),
+        "reminder_count": slots.get("reminder_count"),
     }
+
+
+def extract_schedule_slots(value: str, draft: dict | None = None) -> dict:
+    draft = draft or {}
+    current_step = draft.get("step")
+    slots: dict = {}
+    appointment_type = appointment_type_from_text(value)
+    if appointment_type:
+        slots["appointment_type"] = appointment_type
+        if not draft.get("title"):
+            slots["title"] = f"{appointment_type.title()} appointment"
+
+    date = parse_human_date(value)
+    if date:
+        slots["date"] = date
+
+    time = parse_human_time(value)
+    if time:
+        slots["time"] = time
+
+    duration = parse_event_duration_minutes(value)
+    if duration:
+        slots["duration_minutes"] = duration
+
+    memory_fact = parse_memory_fact(value)
+    if memory_fact:
+        fact_type, location = memory_fact
+        slots["appointment_type"] = slots.get("appointment_type") or fact_type
+        slots["location"] = location
+        slots["save_location_type"] = fact_type
+    elif re.search(r"\b(virtual|at\s+.+)", value, flags=re.IGNORECASE):
+        location = extract_location_from_text(value)
+        fact_type = None
+        if not location and current_step == "location":
+            location, _, fact_type = extract_location_reply(value, draft.get("appointment_type") or appointment_type)
+        if location and not re.search(r"\b(reminder|remind|minutes?|hours?|days?|tomorrow|today|next)\b", location, re.IGNORECASE):
+            slots["location"] = location
+            if fact_type:
+                slots["save_location_type"] = fact_type
+    elif is_skip_location_reply(value):
+        slots["location"] = ""
+        slots["location_skipped"] = True
+
+    reminder_context = current_step in {"reminders", "reminder_times", "reminder_count"} or re.search(
+        r"\b(remind|reminder|reminders)\b", value, flags=re.IGNORECASE
+    )
+    if is_no_reminder_reply(value) and reminder_context:
+        slots["reminder_offsets"] = []
+        slots["wants_reminders"] = False
+        slots["reminder_count"] = "0"
+    else:
+        offsets, was_limited = parse_reminder_offsets(value)
+        if offsets:
+            slots["reminder_offsets"] = offsets
+            slots["wants_reminders"] = True
+            slots["reminder_count"] = str(len(offsets))
+            slots["reminders_limited"] = was_limited
+
+    if is_skip_description_reply(value):
+        slots["description"] = ""
+    return slots
+
+
+def extract_location_from_text(value: str) -> str:
+    if re.search(r"\bvirtual\b", value, flags=re.IGNORECASE):
+        return "Virtual"
+
+    candidates = []
+    for match in re.finditer(r"\bat\s+(?!\d)(?P<location>[A-Za-z][^.,]*?)(?=\s*(?:\.|,|$|\bremind\b))", value, flags=re.IGNORECASE):
+        location = clean_location_text(match.group("location"))
+        if location:
+            candidates.append(location)
+    return candidates[-1] if candidates else ""
+
+
+def merge_schedule_slots(draft: dict, slots: dict) -> list[str]:
+    notes: list[str] = []
+    for key in ("title", "appointment_type", "date", "time", "duration_minutes"):
+        if slots.get(key) and not draft.get(key):
+            draft[key] = slots[key]
+
+    if "location" in slots and not draft.get("location"):
+        draft["location"] = slots["location"]
+        draft["location_skipped"] = not bool(slots["location"])
+
+    if slots.get("save_location_type") and slots.get("location"):
+        appointment_type = slots["save_location_type"]
+        update_appointment_default(appointment_type, "location", slots["location"])
+        notes.append(f"Using {slots['location']} as your usual {appointment_type} location.")
+
+    if slots.get("duration_minutes") and draft.get("appointment_type"):
+        update_appointment_default(str(draft.get("appointment_type")), "duration_minutes", slots["duration_minutes"])
+
+    if "reminder_offsets" in slots and "reminder_offsets" not in draft:
+        draft["reminder_offsets"] = slots["reminder_offsets"]
+        draft["wants_reminders"] = bool(slots["reminder_offsets"])
+        draft["reminder_count"] = str(len(slots["reminder_offsets"]))
+        if draft.get("appointment_type"):
+            update_appointment_default(str(draft.get("appointment_type")), "reminder_offsets", slots["reminder_offsets"])
+        if slots.get("reminders_limited"):
+            notes.append("I can use up to 5 reminders, so I kept the first 5.")
+
+    if "description" in slots and "description" not in draft:
+        draft["description"] = slots["description"]
+
+    return notes
 
 
 def apply_saved_defaults(draft: dict) -> list[str]:
@@ -1003,6 +1189,80 @@ def create_calendar_event(
         .insert(calendarId=GOOGLE_CALENDAR_ID, body=event)
         .execute()
     )
+
+
+def sample_calendar_event_specs(base_date=None) -> list[dict]:
+    if base_date is None:
+        base_date = datetime.now(LOCAL_TZ).date()
+    return [
+        {
+            "title": "[TEST] Dentist appointment",
+            "date_text": f"{(base_date + timedelta(days=1)).isoformat()} 19:30",
+            "duration_minutes": 60,
+            "location": "Scottsdale Dental",
+            "reminder_offsets": [30, 1440],
+            "description": "Bubbles scheduling QA sample event.",
+        },
+        {
+            "title": "[TEST] Virtual bingo",
+            "date_text": f"{(base_date + timedelta(days=2)).isoformat()} 18:00",
+            "duration_minutes": 120,
+            "location": "Virtual",
+            "reminder_offsets": [15],
+            "description": "Bubbles scheduling QA sample event.",
+        },
+        {
+            "title": "[TEST] Haircut appointment",
+            "date_text": f"{(base_date + timedelta(days=3)).isoformat()} 14:00",
+            "duration_minutes": 45,
+            "location": "",
+            "reminder_offsets": [],
+            "description": "Bubbles scheduling QA sample event.",
+        },
+    ]
+
+
+def seed_sample_calendar_events() -> dict:
+    specs = sample_calendar_event_specs()
+    existing_titles = {
+        event.get("summary", "").strip()
+        for event in list_calendar_events(days=90, max_results=25)
+    }
+    created = []
+    skipped = []
+    for spec in specs:
+        if spec["title"] in existing_titles:
+            skipped.append(spec["title"])
+            continue
+        event = create_calendar_event(
+            spec["title"],
+            spec["date_text"],
+            bool(spec["reminder_offsets"]),
+            str(len(spec["reminder_offsets"])),
+            spec["description"],
+            spec["duration_minutes"],
+            spec["location"],
+            spec["reminder_offsets"],
+        )
+        created.append(event.get("summary", spec["title"]))
+    return {"created": created, "skipped": skipped}
+
+
+def sample_calendar_seed_summary(result: dict) -> str:
+    created = result.get("created", [])
+    skipped = result.get("skipped", [])
+    lines = ["✅ Sample calendar seed complete"]
+    lines.append("")
+    lines.append("Created:")
+    lines.extend(f"- {title}" for title in created)
+    if not created:
+        lines.append("- None")
+    lines.append("")
+    lines.append("Skipped existing:")
+    lines.extend(f"- {title}" for title in skipped)
+    if not skipped:
+        lines.append("- None")
+    return "\n".join(lines)
 
 
 def calendar_summary(days: int = 7) -> str:
@@ -1158,6 +1418,20 @@ async def add_event_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Calendar error: {e}")
 
 
+async def seed_test_events_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update):
+        await update.message.reply_text("❌ Not authorized.")
+        return
+    if not BUBBLES_ENABLE_DEV_COMMANDS:
+        await update.message.reply_text("❌ Dev commands are disabled. Set BUBBLES_ENABLE_DEV_COMMANDS=1 to enable this.")
+        return
+
+    try:
+        await update.message.reply_text(sample_calendar_seed_summary(seed_sample_calendar_events())[:4000])
+    except Exception as e:
+        await update.message.reply_text(f"❌ Calendar error: {e}")
+
+
 async def calendar_setup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         await update.message.reply_text("❌ Not authorized.")
@@ -1254,6 +1528,24 @@ async def ask_next_event_question(update: Update, draft: dict, notes: list[str] 
     await send_text(update, f"{prefix} {question}".strip())
 
 
+async def finalize_event_draft(update: Update, draft: dict, description: str = "") -> None:
+    user = update.effective_user
+    date_text = f"{draft['date']} {draft['time']}"
+    event = create_calendar_event(
+        draft["title"],
+        date_text,
+        bool(draft.get("wants_reminders")),
+        str(draft.get("reminder_count", "0")),
+        description,
+        int(draft.get("duration_minutes", 60)),
+        str(draft.get("location", "")),
+        list(draft.get("reminder_offsets", [])),
+    )
+    if user is not None:
+        PENDING_EVENTS.pop(user.id, None)
+    await send_text(update, event_confirmation_text(event, draft["title"], draft))
+
+
 async def continue_event_draft(update: Update, user_input: str) -> bool:
     user = update.effective_user
     if user is None or user.id not in PENDING_EVENTS:
@@ -1269,6 +1561,17 @@ async def continue_event_draft(update: Update, user_input: str) -> bool:
     step = draft.get("step")
 
     try:
+        slots = extract_schedule_slots(user_input, draft)
+        notes = merge_schedule_slots(draft, slots)
+        next_step = next_event_step(draft)
+        keep_specialized_reminder_step = step in {"reminder_count", "reminder_times"} and next_step == "reminders"
+        if next_step != step and not keep_specialized_reminder_step:
+            if next_step == "description":
+                await finalize_event_draft(update, draft, str(draft.get("description", "")))
+                return True
+            await ask_next_event_question(update, draft, notes)
+            return True
+
         if step == "title":
             title = title_case_event(user_input)
             if not title:
@@ -1435,22 +1738,7 @@ async def continue_event_draft(update: Update, user_input: str) -> bool:
                 description = ""
             else:
                 description = "" if is_skip_description_reply(user_input) else user_input.strip()
-            date_text = f"{draft['date']} {draft['time']}"
-            event = create_calendar_event(
-                draft["title"],
-                date_text,
-                bool(draft.get("wants_reminders")),
-                str(draft.get("reminder_count", "0")),
-                description,
-                int(draft.get("duration_minutes", 60)),
-                str(draft.get("location", "")),
-                list(draft.get("reminder_offsets", [])),
-            )
-            PENDING_EVENTS.pop(user.id, None)
-            await send_text(
-                update,
-                event_confirmation_text(event, draft["title"], draft)
-            )
+            await finalize_event_draft(update, draft, description)
             return True
     except Exception as e:
         PENDING_EVENTS.pop(user.id, None)
@@ -1473,7 +1761,16 @@ async def start_event_draft(update: Update, request: dict) -> None:
         "duration_minutes": request.get("duration_minutes"),
         "location": request.get("location", ""),
     }
+    if request.get("location_skipped"):
+        draft["location_skipped"] = True
+    if request.get("reminder_offsets") is not None:
+        draft["reminder_offsets"] = list(request.get("reminder_offsets", []))
+        draft["wants_reminders"] = bool(draft["reminder_offsets"])
+        draft["reminder_count"] = str(len(draft["reminder_offsets"]))
     notes = apply_saved_defaults(draft)
+    if next_event_step(draft) == "description":
+        await finalize_event_draft(update, draft, "")
+        return
     await ask_next_event_question(update, draft, notes)
 
 
@@ -1548,6 +1845,13 @@ def main():
             print(f"❌ {e}")
             raise SystemExit(1) from e
         return
+    if "--seed-sample-events" in sys.argv:
+        try:
+            print(sample_calendar_seed_summary(seed_sample_calendar_events()))
+        except RuntimeError as e:
+            print(f"❌ {e}")
+            raise SystemExit(1) from e
+        return
 
     if not BOT_TOKEN:
         raise RuntimeError("Missing BUBBLES_BOT_TOKEN. Add it to .env or export it in the environment.")
@@ -1563,6 +1867,7 @@ def main():
     app.add_handler(CommandHandler("next", next_command))
     app.add_handler(CommandHandler("free", free_command))
     app.add_handler(CommandHandler("add_event", add_event_command))
+    app.add_handler(CommandHandler("seed_test_events", seed_test_events_command))
     app.add_handler(CommandHandler("calendar_setup", calendar_setup_command))
     app.add_handler(CommandHandler("ls", ls_command))
     app.add_handler(CommandHandler("read", read_command))
