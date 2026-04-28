@@ -55,7 +55,7 @@ OLLAMA_HISTORY_LIMIT = OLLAMA_MAX_HISTORY_TURNS * 2
 OLLAMA_MESSAGE_CHAR_LIMIT = 750
 OLLAMA_PROMPT_CHAR_LIMIT = int(os.getenv("OLLAMA_MAX_PROMPT_CHARS", "1400"))
 OLLAMA_FAILURE_COOLDOWN_THRESHOLD = max(1, int(os.getenv("OLLAMA_FAILURE_COOLDOWN_THRESHOLD", "2")))
-OLLAMA_COOLING_MESSAGE = "My chat brain is cooling down. Email/calendar tools still work."
+OLLAMA_COOLING_MESSAGE = "I’m having trouble thinking deeply right now, but I can still help with email, calendar, and status."
 
 
 def normalize_ollama_base_url(value: str | None) -> str:
@@ -107,6 +107,9 @@ GMAIL_FETCH_LIMIT = max(1, min(int(os.getenv("GMAIL_FETCH_LIMIT", "10")), 25))
 GMAIL_QUERY = os.getenv("GMAIL_QUERY", "newer_than:2d")
 GMAIL_PROMO_QUERY = os.getenv("GMAIL_PROMO_QUERY", "category:promotions newer_than:7d")
 GMAIL_UNREAD_QUERY = os.getenv("GMAIL_UNREAD_QUERY", f"{GMAIL_QUERY} is:unread")
+MAILMAN_RECENT_MODE = "recent"
+MAILMAN_FULL_UNREAD_MODE = "full_unread"
+FULL_UNREAD_QUERY = "is:unread"
 PROACTIVE_DIGESTS_ENABLED = os.getenv("BUBBLES_PROACTIVE_DIGESTS", "1").strip().lower() in {"1", "true", "yes", "on"}
 MORNING_DIGEST_TIME = os.getenv("BUBBLES_MORNING_DIGEST_TIME", "08:00")
 AFTERNOON_DIGEST_TIME = os.getenv("BUBBLES_AFTERNOON_DIGEST_TIME", "13:00")
@@ -120,10 +123,23 @@ EMAIL_CARDS: dict[int, dict] = {}
 NEXT_EMAIL_CARD_ID = 1
 SCAN_BATCHES: dict[int, dict] = {}
 NEXT_SCAN_BATCH_ID = 1
+UNREAD_FEEDS: dict[int, dict] = {}
+NEXT_UNREAD_FEED_ID = 1
 SHOWN_SCAN_ITEM_IDS_BY_DATE: dict[str, dict[str, set[str]]] = {}
 TODAY_IMPORTANT_EMAILS: list[dict] = []
 SCANNED_EMAIL_IDS: set[str] = set()
 RECENT_ACTIONABLE_ITEMS: list[dict] = []
+CONTROLLER_STATE: dict[str, object] = {
+    "latest_email_card_id": None,
+    "latest_email_item": None,
+    "latest_email_choices": [],
+    "latest_appointment_index": None,
+    "latest_item_type": None,
+    "active_scan_batch_id": None,
+    "more_source": None,
+    "more_available": False,
+}
+LAST_UNREAD_FLOW_DEBUG: dict[str, object] = {}
 CHAT_MEMORY: dict[int, list[dict[str, str]]] = {}
 LAST_OLLAMA_HEALTH: dict | None = None
 OLLAMA_OFFLINE_UNTIL: float = 0
@@ -1103,6 +1119,31 @@ def gmail_error_summary(response: requests.Response) -> str:
     return f"Gmail request failed ({response.status_code}): {message or reason or short_body or 'no response body'}"
 
 
+def gmail_query_count(query: str) -> tuple[int | None, str | None]:
+    gmail_issue = gmail_configuration_issue()
+    if gmail_issue:
+        return None, f"Gmail is not configured: {gmail_issue}"
+    token = gmail_access_token()
+    if not token:
+        return None, "Gmail is not configured: no valid Gmail access token was available."
+    try:
+        response = requests.get(
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages",
+            headers={"Authorization": f"Bearer {token}"},
+            params={"maxResults": 1, "q": query},
+            timeout=20,
+        )
+        if response.status_code >= 400:
+            return None, gmail_error_summary(response)
+        data = response.json()
+        estimate = data.get("resultSizeEstimate")
+        if isinstance(estimate, int):
+            return estimate, None
+        return len(data.get("messages", []) or []), None
+    except Exception as e:
+        return None, f"Gmail count failed: {e}"
+
+
 def fetch_gmail_message(message_id: str) -> tuple[dict | None, str | None]:
     if not message_id:
         return None, "I could not find that Gmail message."
@@ -1637,6 +1678,7 @@ def missing_candidate_fields(candidate: dict) -> list[str]:
 
 
 SCAN_PAGE_SIZE = 3
+UNREAD_EMAIL_CHUNK_SIZE = 3
 
 
 def next_email_card_id() -> int:
@@ -1651,6 +1693,13 @@ def next_scan_batch_id() -> int:
     batch_id = NEXT_SCAN_BATCH_ID
     NEXT_SCAN_BATCH_ID += 1
     return batch_id
+
+
+def next_unread_feed_id() -> int:
+    global NEXT_UNREAD_FEED_ID
+    feed_id = NEXT_UNREAD_FEED_ID
+    NEXT_UNREAD_FEED_ID += 1
+    return feed_id
 
 
 def register_email_card(email_item: dict, kind: str) -> int:
@@ -1668,9 +1717,46 @@ def register_email_card(email_item: dict, kind: str) -> int:
     return card_id
 
 
+def controller_context_snapshot() -> dict:
+    return {
+        "latest_email_card_id": CONTROLLER_STATE.get("latest_email_card_id"),
+        "latest_email_item": CONTROLLER_STATE.get("latest_email_item"),
+        "latest_email_choices": list(CONTROLLER_STATE.get("latest_email_choices") or []),
+        "latest_appointment_index": CONTROLLER_STATE.get("latest_appointment_index"),
+        "latest_item_type": CONTROLLER_STATE.get("latest_item_type"),
+        "active_scan_batch_id": CONTROLLER_STATE.get("active_scan_batch_id"),
+        "more_source": CONTROLLER_STATE.get("more_source"),
+        "more_available": bool(CONTROLLER_STATE.get("more_available")),
+    }
+
+
+def controller_remember_email_item(item: dict | None, card_id: int | None = None) -> None:
+    CONTROLLER_STATE["latest_email_item"] = item
+    CONTROLLER_STATE["latest_email_card_id"] = card_id
+    CONTROLLER_STATE["latest_item_type"] = "email"
+    if card_id is not None:
+        CONTROLLER_STATE["latest_email_choices"] = []
+
+
+def controller_remember_appointment(index: int | None) -> None:
+    CONTROLLER_STATE["latest_appointment_index"] = index
+    CONTROLLER_STATE["latest_item_type"] = "appointment"
+
+
+def controller_set_more(source: str | None, batch_id: int | None, available: bool) -> None:
+    CONTROLLER_STATE["more_source"] = source if available else None
+    CONTROLLER_STATE["more_available"] = available
+    if source == "scan":
+        CONTROLLER_STATE["active_scan_batch_id"] = batch_id
+
+
 def remember_actionable_item(item_type: str, item_id: int, label: str = "") -> None:
     RECENT_ACTIONABLE_ITEMS.append({"type": item_type, "id": item_id, "label": label})
     del RECENT_ACTIONABLE_ITEMS[:-8]
+    if item_type == "email":
+        controller_remember_email_item(EMAIL_CARDS.get(item_id), item_id)
+    if item_type == "appointment":
+        controller_remember_appointment(item_id)
 
 
 def active_email_card_ids() -> list[int]:
@@ -2069,26 +2155,27 @@ def render_scan_result(result: dict) -> str:
     important = result.get("important", [])
     candidates = result.get("candidates", [])
     promo_picks = result.get("promo_picks", [])
-    lines = [
-        "Email scan complete",
-        f"{len(important)} important email{'s' if len(important) != 1 else ''}",
-        f"{len(candidates)} appointment email{'s' if len(candidates) != 1 else ''}",
-        f"{len(promo_picks)} promo pick{'s' if len(promo_picks) != 1 else ''}",
-    ]
+    lines = ["I checked your inbox."]
+    if important or candidates or promo_picks:
+        lines.append("")
+        lines.append("Here’s what stood out:")
+        lines.append(f"• {len(important)} important email{'s' if len(important) != 1 else ''}")
+        lines.append(f"• {len(candidates)} appointment item{'s' if len(candidates) != 1 else ''}")
+        lines.append(f"• {len(promo_picks)} promo pick{'s' if len(promo_picks) != 1 else ''}")
     if not important and not promo_picks:
         lines.append("")
-        lines.append("I did not find new items worth surfacing in the recent scan.")
+        lines.append("Nothing new is standing out right now.")
     if errors:
         if lines and lines[-1] != "":
             lines.append("")
-        lines.extend(f"- {error}" for error in errors[:3])
+        lines.extend(f"• {error}" for error in errors[:3])
     return "\n".join(lines).strip()
 
 
 def scan_header_text(total: int, start: int, end: int) -> str:
     if total <= 0:
-        return "Email scan complete\nTotal items: 0"
-    return f"Email scan complete\nTotal items: {total}\nShowing {start}–{end}"
+        return "I checked your inbox, but nothing new needs your attention."
+    return f"I checked your inbox — here’s what matters.\nShowing {start}–{end} of {total}."
 
 
 def digest_item_icon(item: dict) -> str:
@@ -2264,20 +2351,442 @@ def render_mailman_digest(digest: dict) -> str:
     return "\n".join(lines)[:4000]
 
 
-def call_mailman_digest(unread_only: bool = True, limit: int | None = None) -> dict:
+def call_mailman_digest(
+    unread_only: bool = True,
+    limit: int | None = None,
+    query: str | None = None,
+    mode: str = MAILMAN_RECENT_MODE,
+) -> dict:
     if mailman_build_digest is None:
         detail = f": {MAILMAN_IMPORT_ERROR}" if MAILMAN_IMPORT_ERROR else ""
         raise RuntimeError(f"Mailman is not available{detail}")
-    log_event("Bubbles calling Mailman")
-    digest = mailman_build_digest(unread_only=unread_only, limit=limit)
+    log_event("Bubbles calling Mailman", mode=mode)
+    digest = mailman_build_digest(unread_only=unread_only, limit=limit, query=query, mode=mode)
     items = digest.get("items", []) if isinstance(digest, dict) else []
     item_count = len(items) if isinstance(items, list) else 0
-    log_event("Mailman returned X items", count=item_count)
+    summary = digest.get("summary", {}) if isinstance(digest, dict) and isinstance(digest.get("summary"), dict) else {}
+    log_event(
+        "Mailman returned X items",
+        count=item_count,
+        mode=digest.get("mode", mode) if isinstance(digest, dict) else mode,
+        mailman_digest_count=int(summary.get("total", item_count) or 0),
+    )
     return digest
 
 
 def build_mailman_highlights_digest() -> str:
-    return render_mailman_digest(call_mailman_digest(unread_only=True))
+    return render_mailman_digest(call_mailman_digest(unread_only=True, mode=MAILMAN_RECENT_MODE))
+
+
+def unread_email_summary_text(item: dict) -> str:
+    return display_field(item.get("highlight") or item.get("why_it_matters") or item.get("subject"), 110)
+
+
+def unread_email_action_text(item: dict) -> str:
+    action = display_field(item.get("action"), 80)
+    return "Review" if action == "—" else action
+
+
+def unread_email_title_text(item: dict) -> str:
+    subject = display_field(item.get("subject"), 70)
+    when = " ".join(part for part in (compact_text(item.get("date"), 28), compact_text(item.get("time"), 18)) if part)
+    return f"{subject} – {when}" if when else subject
+
+
+def unread_email_message_id(item: dict) -> str:
+    return str(item.get("gmail_message_id") or item.get("message_id") or "")
+
+
+def unread_email_initial_status(item: dict) -> str:
+    return "unread" if item.get("unread", True) else "read"
+
+
+def register_unread_feed(items: list[dict], chat_id: int | None) -> int:
+    feed_id = next_unread_feed_id()
+    feed_items = []
+    batches = []
+    for index, item in enumerate(items, start=1):
+        batch_index = (index - 1) // UNREAD_EMAIL_CHUNK_SIZE
+        feed_items.append(
+            {
+                "number": index,
+                "batch": batch_index,
+                "item": item,
+                "message_id": unread_email_message_id(item),
+                "subject": item.get("subject"),
+                "status": unread_email_initial_status(item),
+            }
+        )
+    for batch_index, start in enumerate(range(0, len(feed_items), UNREAD_EMAIL_CHUNK_SIZE)):
+        indexes = list(range(start + 1, min(start + UNREAD_EMAIL_CHUNK_SIZE, len(feed_items)) + 1))
+        batches.append({"index": batch_index, "indexes": indexes, "message_id": None})
+    UNREAD_FEEDS[feed_id] = {
+        "id": feed_id,
+        "chat_id": chat_id,
+        "items": feed_items,
+        "batches": batches,
+        "global_message_id": None,
+        "created_at": utc_iso_now(),
+    }
+    return feed_id
+
+
+def unread_feed_item(feed: dict, item_number: int) -> dict | None:
+    items = feed.get("items", [])
+    if 1 <= item_number <= len(items):
+        return items[item_number - 1]
+    return None
+
+
+def unread_feed_batch(feed: dict, batch_index: int) -> dict | None:
+    batches = feed.get("batches", [])
+    if 0 <= batch_index < len(batches):
+        return batches[batch_index]
+    return None
+
+
+def unread_batch_keyboard(feed_id: int, batch_index: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ Mark These Read", callback_data=f"unread:br:{feed_id}:{batch_index}"),
+                InlineKeyboardButton("🧠 Summarize These", callback_data=f"unread:bs:{feed_id}:{batch_index}"),
+            ]
+        ]
+    )
+
+
+def unread_global_keyboard(feed_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ Mark All Read", callback_data=f"unread:ar:{feed_id}:all"),
+                InlineKeyboardButton("📬 Leave Unread", callback_data=f"unread:leave:{feed_id}:all"),
+            ]
+        ]
+    )
+
+
+def gmail_modify_error_message(detail: str | None = None) -> str:
+    text = (detail or "").strip()
+    lowered = text.lower()
+    if "modify scope" in lowered or "insufficient" in lowered or "scope" in lowered:
+        return "Gmail modify access is missing. Re-authorize with: python3 bubbles.py --google-auth"
+    if text:
+        return compact_text(text, 300)
+    return "I couldn’t update that email right now."
+
+
+def mailman_item_message_id(item: dict) -> str:
+    return str(item.get("gmail_message_id") or item.get("message_id") or "")
+
+
+def mailman_item_was_shown_today(item: dict) -> bool:
+    message_id = mailman_item_message_id(item)
+    if not message_id:
+        return False
+    return any(value.endswith(f":{message_id}") for value in shown_scan_item_ids_today())
+
+
+def update_unread_flow_debug(
+    *,
+    mode: str,
+    query: str,
+    raw_count: int | None,
+    raw_error: str | None,
+    digest: dict | None,
+    items: list[dict],
+    final_count: int,
+) -> None:
+    surfaced_ids = gmail_previously_surfaced_ids()
+    hidden_by_memory = sum(1 for item in items if mailman_item_message_id(item) in surfaced_ids)
+    shown_today = sum(1 for item in items if mailman_item_was_shown_today(item))
+    mailman_count = len(items)
+    summary = digest.get("summary", {}) if isinstance(digest, dict) and isinstance(digest.get("summary"), dict) else {}
+    errors = digest.get("errors", []) if isinstance(digest, dict) and isinstance(digest.get("errors"), list) else []
+    LAST_UNREAD_FLOW_DEBUG.clear()
+    LAST_UNREAD_FLOW_DEBUG.update(
+        {
+            "at": utc_iso_now(),
+            "mode": mode,
+            "query": query,
+            "raw_unread_count": raw_count,
+            "raw_error": raw_error or "",
+            "mailman_digest_count": int(summary.get("total", mailman_count) or 0),
+            "mailman_items_loaded": mailman_count,
+            "hidden_by_memory_count": hidden_by_memory,
+            "after_memory_filter_count": mailman_count - hidden_by_memory,
+            "shown_today_count": shown_today,
+            "after_shown_today_filter_count": mailman_count - shown_today,
+            "final_count_sent": final_count,
+            "mailman_errors": len(errors),
+        }
+    )
+    log_event(
+        "unread_flow_debug",
+        mode=mode,
+        query=query,
+        raw_unread_count=raw_count if raw_count is not None else "unknown",
+        mailman_digest_count=LAST_UNREAD_FLOW_DEBUG["mailman_digest_count"],
+        hidden_by_memory=hidden_by_memory,
+        shown_today=shown_today,
+        final_count=final_count,
+        raw_error=raw_error or "",
+        mailman_errors=len(errors),
+    )
+
+
+def render_unread_email_feed_message(items: list[dict], start: int, end: int) -> str:
+    lines = ["", "📬 Unread Emails", ""]
+    for display_index, item in enumerate(items[start:end], start=start + 1):
+        emoji = item.get("emoji") or "📩"
+        sender = display_field(item.get("from_display") or item.get("from"), 76)
+        lines.extend(
+            [
+                f"{display_index}. {emoji} {unread_email_title_text(item)}",
+                f"From: {sender}",
+                f"Summary: {display_field(unread_email_summary_text(item), 100)}",
+                f"Action: {display_field(unread_email_action_text(item), 72)}",
+                "",
+            ]
+        )
+    return "\n".join(lines)[:4000]
+
+
+def mailman_error_text(errors: list) -> str:
+    first_error = errors[0] if errors else {}
+    message = first_error.get("message") if isinstance(first_error, dict) else str(first_error)
+    return f"I couldn’t load unread emails right now.\n\n{compact_text(str(message), 220)}"
+
+
+async def send_unread_email_summary(message) -> bool:
+    mode = MAILMAN_FULL_UNREAD_MODE
+    query = FULL_UNREAD_QUERY
+    raw_count, raw_error = gmail_query_count(query)
+    try:
+        digest = call_mailman_digest(unread_only=True, mode=mode)
+    except Exception as e:
+        update_unread_flow_debug(
+            mode=mode,
+            query=query,
+            raw_count=raw_count,
+            raw_error=raw_error,
+            digest=None,
+            items=[],
+            final_count=0,
+        )
+        await message.reply_text(
+            f"I couldn’t load unread emails right now.\n\n{compact_text(str(e), 220)}",
+            disable_web_page_preview=True,
+        )
+        return False
+
+    items = digest.get("items", []) if isinstance(digest.get("items"), list) else []
+    errors = digest.get("errors", []) if isinstance(digest.get("errors"), list) else []
+    update_unread_flow_debug(
+        mode=digest.get("mode", mode) if isinstance(digest, dict) else mode,
+        query=query,
+        raw_count=raw_count,
+        raw_error=raw_error,
+        digest=digest,
+        items=items,
+        final_count=len(items),
+    )
+    if errors and not items:
+        await message.reply_text(mailman_error_text(errors), disable_web_page_preview=True)
+        return False
+    if not items:
+        await message.reply_text("You’re caught up — I don’t see unread emails right now.", disable_web_page_preview=True)
+        return False
+
+    CONTROLLER_STATE["latest_email_choices"] = [
+        {
+            "number": index,
+            "position": ((index - 1) % UNREAD_EMAIL_CHUNK_SIZE) + 1,
+            "item": item,
+            "message_id": item.get("gmail_message_id") or item.get("message_id"),
+            "subject": item.get("subject"),
+        }
+        for index, item in enumerate(items, start=1)
+    ]
+    controller_remember_email_item(items[-1], None)
+    chat_id = getattr(message, "chat_id", None) or getattr(getattr(message, "chat", None), "id", None)
+    feed_id = register_unread_feed(items, chat_id)
+    feed = UNREAD_FEEDS[feed_id]
+    await message.reply_text(f"📬 You have {len(items)} unread email{'s' if len(items) != 1 else ''}. Here’s everything:", disable_web_page_preview=True)
+    for batch_index, start in enumerate(range(0, len(items), UNREAD_EMAIL_CHUNK_SIZE)):
+        end = min(start + UNREAD_EMAIL_CHUNK_SIZE, len(items))
+        sent = await message.reply_text(
+            render_unread_email_feed_message(items, start, end),
+            reply_markup=unread_batch_keyboard(feed_id, batch_index),
+            disable_web_page_preview=True,
+        )
+        if batch_index < len(feed.get("batches", [])):
+            feed["batches"][batch_index]["message_id"] = getattr(sent, "message_id", None)
+    global_message = await message.reply_text(
+        "📬 Actions for all shown",
+        reply_markup=unread_global_keyboard(feed_id),
+        disable_web_page_preview=True,
+    )
+    feed["global_message_id"] = getattr(global_message, "message_id", None)
+    return True
+
+
+def operator_group_name(item: dict) -> str:
+    item_type = str(item.get("type", ""))
+    if item_type == "appointment":
+        return "appointments"
+    if item_type in {"bill", "payment"}:
+        return "bills"
+    if item_type == "security":
+        return "security"
+    return "others"
+
+
+def operator_group_priority(group: str) -> int:
+    order = {
+        "appointments": 0,
+        "bills": 1,
+        "security": 2,
+        "others": 3,
+    }
+    return order.get(group, 99)
+
+
+def build_operator_summary(limit: int = 3) -> dict:
+    if mailman_build_digest is None:
+        detail = f": {MAILMAN_IMPORT_ERROR}" if MAILMAN_IMPORT_ERROR else ""
+        raise RuntimeError(f"Mailman is not available{detail}")
+
+    digest = call_mailman_digest(unread_only=True, limit=12, mode=MAILMAN_RECENT_MODE)
+    items = digest.get("items", []) if isinstance(digest, dict) else []
+    grouped = {
+        "appointments": [],
+        "bills": [],
+        "security": [],
+        "others": [],
+    }
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        grouped[operator_group_name(item)].append(item)
+
+    ordered: list[dict] = []
+    for group in sorted(grouped, key=operator_group_priority):
+        ordered.extend(grouped[group])
+
+    return {
+        "digest": digest,
+        "grouped": grouped,
+        "top_items": ordered[: max(1, limit)],
+    }
+
+
+def operator_item_brief(item: dict) -> str:
+    title = display_field(item.get("subject"), 72)
+    date_text = display_field(item.get("date"), 32)
+    time_text = display_field(item.get("time"), 24)
+    if operator_group_name(item) == "appointments" and date_text and time_text:
+        return f"{title} {date_text} at {time_text}"
+    if operator_group_name(item) == "appointments" and date_text:
+        return f"{title} {date_text}"
+    return display_field(item.get("why_it_matters") or item.get("highlight") or title, 96)
+
+
+def operator_item_line(item: dict) -> str:
+    emoji = item.get("emoji") or "📩"
+    return f"• {emoji} {operator_item_brief(item)}"
+
+
+def build_operator_response() -> str:
+    summary = build_operator_summary(limit=3)
+    digest = summary.get("digest", {}) if isinstance(summary, dict) else {}
+    errors = digest.get("errors", []) if isinstance(digest, dict) else []
+    top_items = summary.get("top_items", []) if isinstance(summary, dict) else []
+
+    if not top_items:
+        if errors:
+            first_error = errors[0] if isinstance(errors[0], dict) else {}
+            message = first_error.get("message") if isinstance(first_error, dict) else str(errors[0])
+            return f"I couldn’t pull things together cleanly.\n\n• {compact_text(str(message), 220)}"
+        return "I checked things over.\n\n• Nothing unread is waiting right now."
+
+    lines = ["Here’s what stands out:", ""]
+    for item in top_items[:3]:
+        lines.append(operator_item_line(item))
+    lines.extend(["", "If you want, I can help you handle one of these."])
+    return "\n".join(lines)[:4000]
+
+
+def render_operator_summary_text(summary: dict) -> str:
+    return build_operator_response()
+
+
+def render_operator_actions_text(summary: dict) -> str:
+    top_items = summary.get("top_items", []) if isinstance(summary, dict) else []
+    if not top_items:
+        return "Right now I don’t see any urgent actions for you."
+
+    lines = ["Here’s what I’d do next:", ""]
+    for index, item in enumerate(top_items[:3], start=1):
+        action = display_field(item.get("action"), 72) or "Review it"
+        lines.append(f"{index}. {action}")
+    lines.extend(["", "Want me to help with one?"])
+    return "\n".join(lines)[:4000]
+
+
+def event_occurs_on_date(event: dict, target_date) -> bool:
+    start = event.get("start", {}) if isinstance(event.get("start"), dict) else {}
+    start_dt = parse_event_datetime(start.get("dateTime", ""))
+    if start_dt:
+        return start_dt.date() == target_date
+    start_date = start.get("date")
+    if not start_date:
+        return False
+    try:
+        return datetime.fromisoformat(start_date).date() == target_date
+    except ValueError:
+        return False
+
+
+def today_calendar_events(max_results: int = 25) -> list[dict]:
+    today = datetime.now(LOCAL_TZ).date()
+    events = list_calendar_events(days=2, max_results=max_results)
+    return [event for event in events if event_occurs_on_date(event, today)]
+
+
+def build_daily_briefing_text() -> str:
+    summary = build_operator_summary(limit=3)
+    today_events = today_calendar_events()
+    top_items = summary.get("top_items", []) if isinstance(summary, dict) else []
+
+    lines = ["Here’s your day:", ""]
+
+    if today_events:
+        lines.append("Today:")
+        for event in today_events[:3]:
+            title = display_field(event.get("summary"), 60)
+            start = event.get("start", {}) if isinstance(event.get("start"), dict) else {}
+            start_dt = parse_event_datetime(start.get("dateTime", ""))
+            if start_dt:
+                lines.append(f"• 📅 {format_local_clock(start_dt.strftime('%H:%M'))} {title}")
+            else:
+                lines.append(f"• 📅 {title}")
+    else:
+        lines.append("Today:")
+        lines.append("• 📅 Nothing on your calendar yet")
+
+    if top_items:
+        lines.extend(["", "What matters:"])
+        for item in top_items[:2]:
+            lines.append(operator_item_line(item))
+        suggestion = display_field(top_items[0].get("action"), 72) or "Check your inbox"
+        lines.extend(["", f"Suggestion: {suggestion}"])
+    else:
+        lines.extend(["", "What matters:", "• No email items to review right now", "", "Suggestion: Use the open time to clear one small task."])
+
+    return "\n".join(lines)[:4000]
 
 
 def build_legacy_highlights_digest() -> str:
@@ -2409,7 +2918,9 @@ async def send_scan_page(message, batch_id: int, start: int = 0) -> bool:
         remember_actionable_item("email", card_id, email_item.get("subject", ""))
         log_event("card_shown", type=item.get("type", "email"), message_id=email_item.get("id", ""))
     batch["offset"] = cursor
-    if batch.get("allow_more", True) and has_unshown_scan_items(items, cursor):
+    more_available = bool(batch.get("allow_more", True) and has_unshown_scan_items(items, cursor))
+    controller_set_more("scan", batch_id, more_available)
+    if more_available:
         await reply_scan_text(message, "Show more scanned emails?", reply_markup=scan_more_keyboard(batch_id))
     return True
 
@@ -2432,6 +2943,7 @@ async def send_scan_batch(message, digest: dict | None = None, allow_more: bool 
         return False
     batch_id = next_scan_batch_id()
     SCAN_BATCHES[batch_id] = {"items": items, "offset": 0, "allow_more": allow_more}
+    CONTROLLER_STATE["active_scan_batch_id"] = batch_id
     sent = await send_scan_page(message, batch_id, 0)
     if not sent:
         await reply_scan_text(
@@ -2462,7 +2974,7 @@ def add_pending_candidate(index: int) -> str:
         return handled_candidate_text("add" if candidate.get("status") == "added" else "skip", index)
     validation_error = validate_email_candidate(candidate)
     if validation_error:
-        return f"I can’t add this yet.\n\n{validation_error}\n\nUse /pending to review what I found."
+        return f"I can’t add this yet.\n\n{validation_error}\n\nAsk me to show the pending items and I’ll walk you through it."
     event = create_calendar_event(
         candidate["title"],
         candidate_date_text(candidate),
@@ -3814,7 +4326,7 @@ async def mailmantest_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     try:
-        digest = call_mailman_digest(unread_only=True)
+        digest = call_mailman_digest(unread_only=True, mode=MAILMAN_RECENT_MODE)
         await update.message.reply_text(render_mailman_test_result(digest), disable_web_page_preview=True)
     except Exception as e:
         log_event("mailman_test_failed", error=e.__class__.__name__)
@@ -3858,6 +4370,71 @@ async def gmail_status_command(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     await update.message.reply_text(gmail_status_text()[:4000])
+
+
+def debug_mail_text() -> str:
+    mode = MAILMAN_FULL_UNREAD_MODE
+    query = FULL_UNREAD_QUERY
+    raw_count, raw_error = gmail_query_count(query)
+    digest = None
+    items: list[dict] = []
+    mailman_error = ""
+    try:
+        digest = call_mailman_digest(unread_only=True, mode=mode)
+        items = digest.get("items", []) if isinstance(digest.get("items"), list) else []
+    except Exception as e:
+        mailman_error = compact_text(str(e), 220)
+    update_unread_flow_debug(
+        mode=digest.get("mode", mode) if isinstance(digest, dict) else mode,
+        query=query,
+        raw_count=raw_count,
+        raw_error=raw_error,
+        digest=digest,
+        items=items,
+        final_count=len(items),
+    )
+    memory = load_memory()
+    lines = [
+        "Debug mail",
+        "",
+        f"Mailman mode: {LAST_UNREAD_FLOW_DEBUG.get('mode', mode)}",
+        f"Full unread query: {query}",
+        f"Recent unread query: {GMAIL_UNREAD_QUERY}",
+        f"Raw unread count: {raw_count if raw_count is not None else 'unknown'}",
+        f"Mailman digest count: {LAST_UNREAD_FLOW_DEBUG.get('mailman_digest_count', 0)}",
+        f"Hidden by memory count: {LAST_UNREAD_FLOW_DEBUG.get('hidden_by_memory_count', 0)}",
+        f"Shown today count: {LAST_UNREAD_FLOW_DEBUG.get('shown_today_count', 0)}",
+        f"Final count sent to Telegram: {LAST_UNREAD_FLOW_DEBUG.get('final_count_sent', 0)}",
+        f"Last scan time: {memory.get('scan', {}).get('last_scan_at') or '—'}",
+        f"Last unread check: {LAST_UNREAD_FLOW_DEBUG.get('at') or '—'}",
+    ]
+    if raw_error:
+        lines.extend(["", f"Raw count issue: {compact_text(raw_error, 220)}"])
+    if mailman_error:
+        lines.extend(["", f"Mailman issue: {mailman_error}"])
+    return "\n".join(lines)[:4000]
+
+
+async def debugmail_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update):
+        await update.message.reply_text("❌ Not authorized.")
+        return
+
+    await update.message.reply_text(debug_mail_text(), disable_web_page_preview=True)
+
+
+async def day_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update):
+        await update.message.reply_text("❌ Not authorized.")
+        return
+
+    try:
+        await update.message.reply_text(build_daily_briefing_text(), disable_web_page_preview=True)
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Day briefing error: {compact_text(str(e), 220)}",
+            disable_web_page_preview=True,
+        )
 
 
 def handled_candidate_text(action: str, index: int) -> str:
@@ -3904,7 +4481,7 @@ async def appointment_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         remember_gmail_id("skipped", candidate.get("source_id", ""))
         mark_scan_item_action_today({"type": "appointment", "index": index}, "skipped")
         log_event("appointment_skipped", source_id=candidate.get("source_id", ""), title=candidate.get("title", ""))
-        await query.answer("Skipped.")
+        await query.answer()
         if query.message:
             await query.edit_message_reply_markup(reply_markup=appointment_status_keyboard(index, "⏸ Skipped", "📬 Left for later"))
         return
@@ -3994,6 +4571,168 @@ async def email_card_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.answer()
 
 
+def mark_unread_feed_item_state(item_state: dict, desired_status: str) -> tuple[bool, bool, str]:
+    current_status = item_state.get("status", "unread")
+    if current_status == desired_status:
+        return True, False, ""
+    message_id = str(item_state.get("message_id") or "")
+    if not message_id:
+        return False, False, "I don’t have a Gmail message ID for that email."
+    reply = mark_gmail_message_unread(message_id) if desired_status == "unread" else mark_gmail_message_read(message_id)
+    if not reply.startswith("✅"):
+        return False, False, gmail_modify_error_message(reply)
+    item_state["status"] = desired_status
+    remember_gmail_id("unread" if desired_status == "unread" else "read", message_id)
+    log_event(f"unread_feed_marked_{desired_status}", message_id=message_id)
+    return True, True, ""
+
+
+def mark_unread_feed_items(feed: dict, item_numbers: list[int], desired_status: str) -> tuple[int, list[str]]:
+    changed = 0
+    errors = []
+    for item_number in item_numbers:
+        item_state = unread_feed_item(feed, int(item_number))
+        if not item_state:
+            errors.append("One of those emails is no longer available.")
+            continue
+        ok, did_change, error = mark_unread_feed_item_state(item_state, desired_status)
+        if ok and did_change:
+            changed += 1
+        if error:
+            errors.append(error)
+    return changed, errors
+
+
+def unread_batch_summary_text(feed: dict, batch_index: int) -> str:
+    batch = unread_feed_batch(feed, batch_index)
+    if not batch:
+        return "I don’t have that email group anymore."
+    lines = ["🧠 Group Summary", ""]
+    for item_number in batch.get("indexes", []):
+        item_state = unread_feed_item(feed, int(item_number))
+        if not item_state:
+            continue
+        item = item_state.get("item", {})
+        title = display_field(item.get("subject"), 72)
+        summary = display_field(unread_email_summary_text(item), 110)
+        lines.append(f"{int(item_number)}. {title}")
+        lines.append(f"   {summary}")
+    if len(lines) == 2:
+        lines.append("No emails found in this group.")
+    return "\n".join(lines)[:4000]
+
+
+async def refresh_unread_batch_markup(context: ContextTypes.DEFAULT_TYPE, feed: dict, batch_index: int, query=None) -> None:
+    batch = unread_feed_batch(feed, batch_index)
+    if not batch:
+        return
+    reply_markup = unread_batch_keyboard(int(feed["id"]), batch_index)
+    message_id = batch.get("message_id")
+    try:
+        if query and query.message and getattr(query.message, "message_id", None) == message_id:
+            await query.edit_message_reply_markup(reply_markup=reply_markup)
+            return
+        chat_id = feed.get("chat_id")
+        if chat_id and message_id:
+            await context.bot.edit_message_reply_markup(chat_id=chat_id, message_id=message_id, reply_markup=reply_markup)
+    except Exception as e:
+        log_event("unread_batch_markup_update_failed", error=e.__class__.__name__, batch=batch_index)
+
+
+async def refresh_unread_global_markup(context: ContextTypes.DEFAULT_TYPE, feed: dict, query=None) -> None:
+    message_id = feed.get("global_message_id")
+    reply_markup = unread_global_keyboard(int(feed["id"]))
+    try:
+        if query and query.message and getattr(query.message, "message_id", None) == message_id:
+            await query.edit_message_reply_markup(reply_markup=reply_markup)
+            return
+        chat_id = feed.get("chat_id")
+        if chat_id and message_id:
+            await context.bot.edit_message_reply_markup(chat_id=chat_id, message_id=message_id, reply_markup=reply_markup)
+    except Exception as e:
+        log_event("unread_global_markup_update_failed", error=e.__class__.__name__)
+
+
+async def refresh_unread_feed_markups(context: ContextTypes.DEFAULT_TYPE, feed: dict, query=None) -> None:
+    for batch in feed.get("batches", []):
+        await refresh_unread_batch_markup(context, feed, int(batch.get("index", 0)), query=query)
+    await refresh_unread_global_markup(context, feed, query=query)
+
+
+async def report_unread_action_errors(query, errors: list[str]) -> None:
+    message = gmail_modify_error_message(errors[0] if errors else "")
+    await query.answer("I couldn’t update every email.", show_alert=True)
+    if query.message:
+        await query.message.reply_text(message[:4000], disable_web_page_preview=True)
+
+
+async def unread_email_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query is None:
+        return
+    if not is_authorized(update):
+        await query.answer("Not authorized.", show_alert=True)
+        return
+
+    parts = (query.data or "").split(":")
+    if len(parts) != 4 or parts[0] != "unread":
+        await query.answer()
+        return
+    action = parts[1]
+    try:
+        feed_id = int(parts[2])
+    except ValueError:
+        await query.answer("That unread feed is not valid.", show_alert=True)
+        return
+    feed = UNREAD_FEEDS.get(feed_id)
+    if not feed:
+        await query.answer("That unread feed is no longer available.", show_alert=True)
+        if query.message:
+            await query.edit_message_reply_markup(reply_markup=None)
+        return
+
+    if action in {"br", "bs"}:
+        try:
+            batch_index = int(parts[3])
+        except ValueError:
+            await query.answer("That email batch is not valid.", show_alert=True)
+            return
+        batch = unread_feed_batch(feed, batch_index)
+        if not batch:
+            await query.answer("That email batch is no longer available.", show_alert=True)
+            return
+        if action == "bs":
+            await query.answer()
+            if query.message:
+                await query.message.reply_text(unread_batch_summary_text(feed, batch_index), disable_web_page_preview=True)
+            return
+        _, errors = mark_unread_feed_items(feed, [int(number) for number in batch.get("indexes", [])], "read")
+        await refresh_unread_batch_markup(context, feed, batch_index, query=query)
+        await refresh_unread_global_markup(context, feed)
+        if errors:
+            await report_unread_action_errors(query, errors)
+        else:
+            await query.answer()
+        return
+
+    if action == "ar":
+        item_numbers = [int(item.get("number", 0)) for item in feed.get("items", []) if item.get("number")]
+        _, errors = mark_unread_feed_items(feed, item_numbers, "read")
+        await refresh_unread_feed_markups(context, feed, query=query)
+        if errors:
+            await report_unread_action_errors(query, errors)
+        else:
+            await query.answer()
+        return
+
+    if action == "leave":
+        await query.answer("Left unread.")
+        await refresh_unread_global_markup(context, feed, query=query)
+        return
+
+    await query.answer()
+
+
 async def scan_more_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if query is None:
@@ -4021,7 +4760,7 @@ async def scan_more_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     start = int(batch.get("offset", 0))
     if start >= len(batch.get("items", [])):
-        await query.answer("No more items.")
+        await query.answer()
         if query.message:
             await query.edit_message_reply_markup(reply_markup=None)
         return
@@ -4031,7 +4770,7 @@ async def scan_more_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.edit_message_reply_markup(reply_markup=None)
         sent = await send_scan_page(query.message, batch_id, start)
         if not sent:
-            await query.message.reply_text("No more new scanned emails to show today.", disable_web_page_preview=True)
+            await query.message.reply_text("That’s everything new I found for now.", disable_web_page_preview=True)
 
 
 def parse_pending_index(args: list[str]) -> int | None:
@@ -4050,7 +4789,7 @@ async def add_pending_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     index = parse_pending_index(context.args)
     if index is None:
-        await update.message.reply_text("Use /add <number> from the /pending list.")
+        await update.message.reply_text("Send the item number you want me to add.")
         return
     try:
         await update.message.reply_text(add_pending_candidate(index)[:4000])
@@ -4065,7 +4804,7 @@ async def skip_pending_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
     index = parse_pending_index(context.args)
     if index is None:
-        await update.message.reply_text("Use /skip <number> from the /pending list.")
+        await update.message.reply_text("Send the item number you want me to leave for later.")
         return
     if index < 1 or index > len(PENDING_EMAIL_APPOINTMENTS):
         await update.message.reply_text("That pending item number is not available.")
@@ -4077,7 +4816,7 @@ async def skip_pending_command(update: Update, context: ContextTypes.DEFAULT_TYP
     candidate["status"] = "skipped"
     remember_gmail_id("skipped", candidate.get("source_id", ""))
     log_event("appointment_skipped", source_id=candidate.get("source_id", ""), title=candidate.get("title", ""))
-    await update.message.reply_text(f"Skipped this appointment candidate:\n\n{candidate.get('title', 'Untitled appointment')}")
+    return
 
 
 async def add_all_pending_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4207,8 +4946,8 @@ def resolve_action_target(text: str, action: str, item_type: str) -> tuple[int |
     if len(candidates) == 1:
         return candidates[0], None
     if len(candidates) > 1:
-        return None, "I found multiple items. Say add 1, skip 2, summarize 3, or use the buttons."
-    return None, "I don’t have a current item for that yet. Try asking me to check your email."
+        return None, "I found a few items. Tell me the number you want, or use the buttons."
+    return None, "I don’t have a current item for that yet. Ask me to check your email first."
 
 
 async def add_appointment_from_intent(update: Update, index: int) -> None:
@@ -4227,7 +4966,7 @@ async def skip_appointment_from_intent(update: Update, index: int) -> None:
     remember_gmail_id("skipped", candidate.get("source_id", ""))
     mark_scan_item_action_today({"type": "appointment", "index": index}, "skipped")
     log_event("appointment_skipped", source_id=candidate.get("source_id", ""), title=candidate.get("title", ""))
-    await update.message.reply_text(f"Skipped this appointment candidate:\n\n{candidate.get('title', 'Untitled appointment')}", disable_web_page_preview=True)
+    return
 
 
 async def email_card_action_from_intent(update: Update, card_id: int, action: str) -> None:
@@ -4242,7 +4981,6 @@ async def email_card_action_from_intent(update: Update, card_id: int, action: st
             remember_gmail_id("read", card.get("id", ""))
             mark_scan_item_status_today(card.get("scan_identity", ""), "read")
             log_event("email_read", message_id=card.get("id", ""))
-            await update.message.reply_text("Marked read.")
         else:
             await update.message.reply_text(reply[:4000], disable_web_page_preview=True)
         return
@@ -4252,7 +4990,6 @@ async def email_card_action_from_intent(update: Update, card_id: int, action: st
             card["status"] = "unread"
             remember_gmail_id("unread", card.get("id", ""))
             log_event("email_unread", message_id=card.get("id", ""))
-            await update.message.reply_text("Left unread.")
         else:
             await update.message.reply_text(reply[:4000], disable_web_page_preview=True)
         return
@@ -4272,22 +5009,374 @@ async def email_card_action_from_intent(update: Update, card_id: int, action: st
         remember_gmail_id("skipped", card.get("id", ""))
         mark_scan_item_status_today(card.get("scan_identity", ""), "skipped")
         log_event("email_skipped", message_id=card.get("id", ""))
-        await update.message.reply_text("Skipped.")
+        return
 
 
 async def show_more_from_intent(update: Update) -> None:
     batch_id = latest_scan_batch_id()
     if batch_id is None:
-        await update.message.reply_text("I don’t have more emails queued. Try asking me to check your email.")
+        await update.message.reply_text("I don’t have anything else queued right now.")
         return
     batch = SCAN_BATCHES.get(batch_id, {})
     start = int(batch.get("offset", 0))
     if start >= len(batch.get("items", [])):
-        await update.message.reply_text("No more new scanned emails to show today.", disable_web_page_preview=True)
+        await update.message.reply_text("That’s everything new I found for now.", disable_web_page_preview=True)
         return
     sent = await send_scan_page(update.message, batch_id, start)
     if not sent:
-        await update.message.reply_text("No more new scanned emails to show today.", disable_web_page_preview=True)
+        await update.message.reply_text("That’s everything new I found for now.", disable_web_page_preview=True)
+
+
+CONTROLLER_INTENTS = {
+    "show_unread_emails",
+    "show_highlights",
+    "run_scan_cards",
+    "show_more",
+    "summarize_latest_email",
+    "mark_latest_read",
+    "mark_latest_unread",
+    "add_latest_appointment",
+    "skip_latest_item",
+    "show_calendar",
+    "show_status",
+    "show_help",
+    "reset_brain",
+    "general_chat",
+    "unknown",
+}
+
+
+def controller_decision(intent: str, confidence: float, reason: str, target=None) -> dict:
+    return {
+        "intent": intent if intent in CONTROLLER_INTENTS else "unknown",
+        "confidence": max(0.0, min(float(confidence), 1.0)),
+        "target": target,
+        "reason": reason,
+    }
+
+
+def controller_target_number(text: str) -> int | None:
+    match = re.search(r"\b(?:email|item|message|number)?\s*(\d{1,2})\b", text)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def controller_has_tool_word(text: str) -> bool:
+    return any(
+        word in text
+        for word in (
+            "email",
+            "emails",
+            "inbox",
+            "unread",
+            "important",
+            "highlight",
+            "scan",
+            "calendar",
+            "appointment",
+            "status",
+            "read",
+            "skip",
+            "summarize",
+            "summarise",
+        )
+    )
+
+
+def deterministic_interpret_user_message(user_text: str, context: dict) -> dict:
+    text = normalize_intent_text(user_text)
+    target_number = controller_target_number(text)
+    if not text:
+        return controller_decision("unknown", 0.0, "empty message")
+
+    if text in {"help", "help me", "what can you do", "what do you do", "capabilities", "how can you help"}:
+        return controller_decision("show_help", 0.98, "user asked for help")
+    if any(phrase in text for phrase in ("reset your brain", "reset brain", "clear your brain", "clear brain")):
+        return controller_decision("reset_brain", 0.98, "user asked to reset brain")
+    if text in {"status", "show status", "system status"} or any(phrase in text for phrase in ("are you working", "is everything working", "are you online")):
+        return controller_decision("show_status", 0.97, "user asked for status")
+    if any(phrase in text for phrase in ("show more", "show more emails", "more emails", "next emails", "show 3 more")):
+        return controller_decision("show_more", 0.96, "user asked for more items")
+
+    if any(phrase in text for phrase in ("check my email", "check my emails", "check my inbox", "show unread emails", "show unread email", "show me unread emails", "show me the unread ones", "show my unread", "show inbox", "show my inbox", "what emails do i have", "read my email", "read my emails", "summarize my inbox", "summarize my emails", "summarise my emails", "anything new")) and not any(word in text for word in ("important", "urgent", "highlight")):
+        return controller_decision("show_unread_emails", 0.96, "user asked to see unread email")
+    if any(phrase in text for phrase in ("anything important", "anything urgent", "what should i care about", "what should i do", "what needs my attention", "show important emails", "show urgent emails", "highlights", "show highlights", "show my highlights", "inbox highlights")):
+        return controller_decision("show_highlights", 0.95, "user asked for priority email view")
+    if any(phrase in text for phrase in ("scan emails", "scan email", "scan my inbox", "action cards", "show cards")):
+        return controller_decision("run_scan_cards", 0.94, "user asked for actionable scan cards")
+
+    if any(phrase in text for phrase in ("summarize that", "summarise that", "summarize this", "summarise this", "summarize it", "summarise it", "summarize latest email", "summarise latest email", "what does it say", "summary of that")) or re.search(r"\b(summarize|summarise)\s+\d{1,2}\b", text):
+        return controller_decision("summarize_latest_email", 0.92, "user asked to summarize latest email", target_number)
+    if any(phrase in text for phrase in ("mark it read", "mark this read", "mark that read", "mark email read", "mark latest read", "mark as read")) or re.search(r"\bmark\s+\d{1,2}\s+read\b", text):
+        return controller_decision("mark_latest_read", 0.96, "user clearly asked to mark email read", target_number)
+    if any(phrase in text for phrase in ("mark it unread", "mark this unread", "mark that unread", "mark latest unread", "leave it unread", "leave this unread", "mark as unread")) or re.search(r"\bmark\s+\d{1,2}\s+unread\b", text):
+        return controller_decision("mark_latest_unread", 0.96, "user clearly asked to mark email unread", target_number)
+    if any(phrase in text for phrase in ("add that appointment", "add the appointment", "add latest appointment", "add it to my calendar", "add that to my calendar", "put it on my calendar", "put that on my calendar")) or re.search(r"\b(add|put)\s+\d{1,2}\b", text):
+        return controller_decision("add_latest_appointment", 0.95, "user clearly asked to add appointment", target_number)
+    if any(phrase in text for phrase in ("skip that", "skip this", "skip it", "skip latest", "dismiss that", "dismiss this", "leave it")) or re.search(r"\b(skip|dismiss)\s+\d{1,2}\b", text):
+        return controller_decision("skip_latest_item", 0.86, "user asked to skip latest item", target_number)
+
+    if any(phrase in text for phrase in ("show calendar", "check calendar", "what is on my calendar", "what s on my calendar", "do i have anything today", "what do i have today", "anything today", "my schedule")):
+        target = {"days": 1} if "today" in text else None
+        return controller_decision("show_calendar", 0.92, "user asked for calendar", target)
+
+    if controller_has_tool_word(text):
+        return controller_decision("unknown", 0.45, "tool-related message was ambiguous", target_number)
+    return controller_decision("general_chat", 0.88, "no tool intent matched")
+
+
+def extract_json_object(raw: str) -> dict | None:
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start == -1 or end == -1 or end < start:
+            return None
+        try:
+            return json.loads(raw[start : end + 1])
+        except json.JSONDecodeError:
+            return None
+
+
+def ollama_classify_intent(user_text: str, context: dict) -> dict | None:
+    if ollama_cooldown_remaining() > 0:
+        return None
+    prompt = (
+        "Classify this Telegram message for Bubbles. JSON only.\n"
+        "Bubbles has email, calendar, status, scan, and help tools. Do not answer the user.\n"
+        "Intents: show_unread_emails, show_highlights, run_scan_cards, show_more, summarize_latest_email, "
+        "mark_latest_read, mark_latest_unread, add_latest_appointment, skip_latest_item, show_calendar, "
+        "show_status, show_help, reset_brain, general_chat, unknown.\n"
+        'Return {"intent":"...","confidence":0.0,"target":null,"reason":"..."}.\n'
+        f"Context: more={bool(context.get('more_available'))}, latest_email={bool(context.get('latest_email_item'))}, latest_appointment={bool(context.get('latest_appointment_index'))}\n"
+        f"Message: {cap_text(user_text, 220)}"
+    )
+    try:
+        response = requests.post(
+            OLLAMA_GENERATE_URL,
+            json={
+                "model": MODEL,
+                "prompt": cap_text(prompt, 1200),
+                "stream": False,
+                "options": {"num_predict": 80, "temperature": 0},
+            },
+            timeout=OLLAMA_REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+        mark_ollama_online()
+    except requests.Timeout as e:
+        mark_ollama_failure(e.__class__.__name__, timed_out=True)
+        log_event("ollama_timeout", area="controller", error=e.__class__.__name__, failures=OLLAMA_CONSECUTIVE_FAILURES)
+        return None
+    except Exception as e:
+        mark_ollama_failure(e.__class__.__name__)
+        log_event("ollama_error", area="controller", error=e.__class__.__name__)
+        return None
+
+    parsed = extract_json_object(parse_ollama_response(response.json()))
+    if not isinstance(parsed, dict):
+        return None
+    intent = str(parsed.get("intent", "unknown")).strip()
+    if intent not in CONTROLLER_INTENTS:
+        return None
+    try:
+        confidence = float(parsed.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    return controller_decision(
+        intent,
+        confidence,
+        str(parsed.get("reason") or "classified by Ollama"),
+        parsed.get("target"),
+    )
+
+
+def interpret_user_message(user_text, context) -> dict:
+    deterministic = deterministic_interpret_user_message(user_text, context)
+    if deterministic.get("confidence", 0) >= 0.85:
+        return deterministic
+    ai_decision = ollama_classify_intent(user_text, context)
+    if ai_decision and ai_decision.get("confidence", 0) >= 0.55:
+        return ai_decision
+    return deterministic
+
+
+def mailman_item_to_email(item: dict) -> dict:
+    return {
+        "id": item.get("gmail_message_id") or item.get("message_id") or "",
+        "sender": item.get("from") or item.get("from_display") or "Unknown",
+        "subject": item.get("subject") or "(no subject)",
+        "snippet": item.get("highlight") or item.get("why_it_matters") or "",
+        "body": item.get("highlight") or item.get("why_it_matters") or "",
+        "unread": item.get("unread", True),
+    }
+
+
+def resolve_controller_email_target(target=None) -> tuple[dict | None, str | None]:
+    choices = list(CONTROLLER_STATE.get("latest_email_choices") or [])
+    target_number = target if isinstance(target, int) else None
+    if isinstance(target, str) and target.isdigit():
+        target_number = int(target)
+    if target_number is not None:
+        for choice in choices:
+            if choice.get("number") == target_number or choice.get("position") == target_number:
+                return {"mailman_item": choice.get("item"), "message_id": choice.get("message_id")}, None
+        return None, "I don’t see that email number in the current list."
+    if choices and CONTROLLER_STATE.get("latest_email_card_id") is None and len(choices) > 1:
+        labels = ", ".join(str(choice.get("number")) for choice in choices if choice.get("number"))
+        return None, f"Which email should I use? Send {labels}."
+    card_id = CONTROLLER_STATE.get("latest_email_card_id")
+    if isinstance(card_id, int) and card_id in EMAIL_CARDS:
+        return {"card_id": card_id, "message_id": EMAIL_CARDS[card_id].get("id"), "card": EMAIL_CARDS[card_id]}, None
+    item = CONTROLLER_STATE.get("latest_email_item")
+    if isinstance(item, dict):
+        return {"mailman_item": item, "message_id": item.get("gmail_message_id") or item.get("message_id")}, None
+    return None, "I don’t have an email in focus yet."
+
+
+def controller_target_email_payload(target: dict) -> tuple[dict, str | None]:
+    message_id = str(target.get("message_id") or "")
+    if message_id:
+        email_item, error = fetch_gmail_message(message_id)
+        if email_item:
+            return email_item, None
+        if "mailman_item" not in target:
+            return {}, error or "I couldn’t open that email."
+    if target.get("card"):
+        return target["card"], None
+    if target.get("mailman_item"):
+        return mailman_item_to_email(target["mailman_item"]), None
+    return {}, "I couldn’t find that email."
+
+
+async def summarize_controller_latest_email(update: Update, target=None) -> None:
+    email_target, problem = resolve_controller_email_target(target)
+    if problem:
+        await update.message.reply_text(problem, disable_web_page_preview=True)
+        return
+    email_item, error = controller_target_email_payload(email_target)
+    if error:
+        await update.message.reply_text(error[:4000], disable_web_page_preview=True)
+        return
+    await update.message.reply_text(summarize_email_item(email_item)[:4000], disable_web_page_preview=True)
+
+
+async def mark_controller_latest_email(update: Update, unread: bool, target=None) -> None:
+    email_target, problem = resolve_controller_email_target(target)
+    if problem:
+        await update.message.reply_text(problem, disable_web_page_preview=True)
+        return
+    message_id = str(email_target.get("message_id") or "")
+    if not message_id:
+        await update.message.reply_text("I don’t have a Gmail message for that email.", disable_web_page_preview=True)
+        return
+    reply = mark_gmail_message_unread(message_id) if unread else mark_gmail_message_read(message_id)
+    if not reply.startswith("✅"):
+        await update.message.reply_text(reply[:4000], disable_web_page_preview=True)
+        return
+    card_id = email_target.get("card_id")
+    if isinstance(card_id, int) and card_id in EMAIL_CARDS:
+        EMAIL_CARDS[card_id]["status"] = "unread" if unread else "read"
+    remember_gmail_id("unread" if unread else "read", message_id)
+    await update.message.reply_text("Done.", disable_web_page_preview=True)
+
+
+async def add_controller_latest_appointment(update: Update) -> None:
+    index = CONTROLLER_STATE.get("latest_appointment_index")
+    if not isinstance(index, int):
+        await update.message.reply_text("I don’t have an appointment in focus. Ask me to scan for action cards first.")
+        return
+    await add_appointment_from_intent(update, index)
+
+
+async def skip_controller_latest_item(update: Update, target=None) -> None:
+    latest_type = CONTROLLER_STATE.get("latest_item_type")
+    if latest_type == "appointment":
+        index = CONTROLLER_STATE.get("latest_appointment_index")
+        if isinstance(index, int):
+            await skip_appointment_from_intent(update, index)
+            await update.message.reply_text("Done.", disable_web_page_preview=True)
+            return
+    if latest_type == "email":
+        email_target, problem = resolve_controller_email_target(target)
+        if problem:
+            await update.message.reply_text(problem, disable_web_page_preview=True)
+            return
+        card_id = email_target.get("card_id") if email_target else None
+        if isinstance(card_id, int):
+            await email_card_action_from_intent(update, card_id, "skip")
+            await update.message.reply_text("Done.", disable_web_page_preview=True)
+            return
+        await update.message.reply_text("That email list is read-only. Use scan cards if you want to skip items.", disable_web_page_preview=True)
+        return
+    await update.message.reply_text("Which item should I skip?", disable_web_page_preview=True)
+
+
+async def show_more_from_controller(update: Update, context_snapshot: dict) -> None:
+    source = context_snapshot.get("more_source")
+    if source == "scan":
+        await show_more_from_intent(update)
+        return
+    await update.message.reply_text("I don’t have more items queued right now.", disable_web_page_preview=True)
+
+
+async def route_controller_intent(update: Update, user_input: str, decision: dict, context_snapshot: dict) -> bool:
+    intent = decision.get("intent")
+    target = decision.get("target")
+    if intent == "show_unread_emails":
+        await send_unread_email_summary(update.message)
+        return True
+    if intent == "show_highlights":
+        await update.message.reply_text(build_highlights_digest(), disable_web_page_preview=True)
+        return True
+    if intent == "run_scan_cards":
+        await send_scan_results(update)
+        return True
+    if intent == "show_more":
+        await show_more_from_controller(update, context_snapshot)
+        return True
+    if intent == "summarize_latest_email":
+        await summarize_controller_latest_email(update, target)
+        return True
+    if intent == "mark_latest_read":
+        await mark_controller_latest_email(update, False, target)
+        return True
+    if intent == "mark_latest_unread":
+        await mark_controller_latest_email(update, True, target)
+        return True
+    if intent == "add_latest_appointment":
+        await add_controller_latest_appointment(update)
+        return True
+    if intent == "skip_latest_item":
+        await skip_controller_latest_item(update, target)
+        return True
+    if intent == "show_calendar":
+        days = int(target.get("days", 0)) if isinstance(target, dict) and str(target.get("days", "")).isdigit() else parse_days_from_text(user_input)
+        await update.message.reply_text(calendar_summary(days), disable_web_page_preview=True)
+        return True
+    if intent == "show_status":
+        await update.message.reply_text(service_status_text()[:4000], disable_web_page_preview=True)
+        return True
+    if intent == "show_help":
+        await update.message.reply_text(assistant_help_text()[:4000], disable_web_page_preview=True)
+        return True
+    if intent == "reset_brain":
+        reset_ollama_state()
+        await update.message.reply_text("Done. I cleared the chat cooldown.", disable_web_page_preview=True)
+        return True
+    if intent == "unknown" and controller_has_tool_word(normalize_intent_text(user_input)):
+        await update.message.reply_text("I can help with that. Do you want unread emails, highlights, scan cards, calendar, or status?", disable_web_page_preview=True)
+        return True
+    return False
+
+
+async def route_operator_intent(update: Update, user_input: str) -> bool:
+    context_snapshot = controller_context_snapshot()
+    decision = interpret_user_message(user_input, context_snapshot)
+    log_event("controller_intent", intent=decision.get("intent"), confidence=decision.get("confidence"), reason=decision.get("reason", ""))
+    return await route_controller_intent(update, user_input, decision, context_snapshot)
 
 
 async def route_assistant_intent(update: Update, user_input: str) -> bool:
@@ -4346,19 +5435,9 @@ async def route_assistant_intent(update: Update, user_input: str) -> bool:
     scan_phrases = (
         "scan emails",
         "scan email",
-        "check my email",
-        "check my emails",
-        "check my inbox",
         "scan my inbox",
-        "anything important",
-        "anything new",
         "what s in my email",
         "whats in my email",
-        "what s important today",
-        "whats important today",
-        "summarize my inbox",
-        "summarize my emails",
-        "summarise my emails",
     )
     if any(phrase in text for phrase in scan_phrases):
         await update.message.reply_text("Checking now.", disable_web_page_preview=True)
@@ -4869,6 +5948,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await continue_event_draft(update, user_input):
         return
 
+    if await route_operator_intent(update, user_input):
+        remember_message(user.id, "user", user_input)
+        return
+
     if await route_assistant_intent(update, user_input):
         remember_message(user.id, "user", user_input)
         return
@@ -4972,6 +6055,8 @@ def main():
     app.add_handler(CommandHandler("workflow", workflow_command))
     app.add_handler(CommandHandler("mailmantest", mailmantest_command))
     app.add_handler(CommandHandler("gmailstatus", gmail_status_command))
+    app.add_handler(CommandHandler("debugmail", debugmail_command))
+    app.add_handler(CommandHandler("day", day_command))
     app.add_handler(CommandHandler("summary", email_summary_command))
     app.add_handler(CommandHandler("pending", pending_command))
     app.add_handler(CommandHandler("add", add_pending_command))
@@ -4985,6 +6070,7 @@ def main():
     app.add_handler(CommandHandler("read", read_command))
     app.add_handler(CommandHandler("write", write_command))
     app.add_handler(CallbackQueryHandler(appointment_callback, pattern=r"^appt:"))
+    app.add_handler(CallbackQueryHandler(unread_email_callback, pattern=r"^unread:"))
     app.add_handler(CallbackQueryHandler(email_card_callback, pattern=r"^email:"))
     app.add_handler(CallbackQueryHandler(scan_more_callback, pattern=r"^scan:more:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

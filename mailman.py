@@ -52,6 +52,7 @@ GMAIL_MODIFY_SCOPE = "https://www.googleapis.com/auth/gmail.modify"
 GMAIL_FETCH_LIMIT = max(1, min(int(os.getenv("GMAIL_FETCH_LIMIT", "10")), 25))
 GMAIL_QUERY = os.getenv("GMAIL_QUERY", "newer_than:2d")
 GMAIL_UNREAD_QUERY = os.getenv("GMAIL_UNREAD_QUERY", f"{GMAIL_QUERY} is:unread")
+GMAIL_FULL_UNREAD_QUERY = "is:unread"
 try:
     LOCAL_TZ = ZoneInfo(GOOGLE_CALENDAR_TIMEZONE)
 except ZoneInfoNotFoundError:
@@ -939,8 +940,24 @@ def load_mailman_messages(query: str) -> tuple[list[EmailItem], list[AccountErro
     return items, errors
 
 
-def build_mailman_digest(unread_only: bool = True, query: str | None = None, limit: int | None = None) -> dict[str, Any]:
-    scan_query = query or (GMAIL_UNREAD_QUERY if unread_only else GMAIL_QUERY)
+def normalize_digest_mode(mode: str | None) -> str:
+    return "full_unread" if mode == "full_unread" else "recent"
+
+
+def digest_query_for_mode(mode: str, unread_only: bool = True) -> str:
+    if mode == "full_unread":
+        return GMAIL_FULL_UNREAD_QUERY
+    return GMAIL_UNREAD_QUERY if unread_only else GMAIL_QUERY
+
+
+def build_mailman_digest(
+    unread_only: bool = True,
+    query: str | None = None,
+    limit: int | None = None,
+    mode: str = "recent",
+) -> dict[str, Any]:
+    digest_mode = normalize_digest_mode(mode)
+    scan_query = digest_query_for_mode(digest_mode, unread_only)
     messages, account_errors = load_mailman_messages(scan_query)
     digest_items = [build_digest_item(item) for item in messages]
     digest_items.sort(key=lambda entry: (-int(entry.get("_score", 0)), str(entry.get("received_at", "")), str(entry.get("id", ""))))
@@ -964,6 +981,7 @@ def build_mailman_digest(unread_only: bool = True, query: str | None = None, lim
     }
     return {
         "agent": "mailman",
+        "mode": digest_mode,
         "generated_at": now_utc().replace(microsecond=0).isoformat(),
         "query": scan_query,
         "read_only": True,
