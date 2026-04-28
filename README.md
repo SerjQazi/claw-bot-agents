@@ -23,15 +23,67 @@ uvicorn api:app --host 0.0.0.0 --port 8000
 Then open:
 
 - `http://127.0.0.1:8000/`
+- `http://127.0.0.1:8000/control`
 - `http://127.0.0.1:8000/health`
 - `http://127.0.0.1:8000/system`
 - `http://127.0.0.1:8000/agents`
+- `http://127.0.0.1:8000/coding/plan?request=make%20dashboard%20better`
+
+## Command Center
+
+The control panel at `/control` supports safe slash commands through
+`POST /command`.
+
+Examples:
+
+```text
+/system health
+/git status
+/git push update dashboard controls
+/git branch feature/test
+/code plan improve dashboard
+```
+
+Safe read-only commands run immediately. Git push and branch commands return an
+approval prompt first, then run only through `POST /command/approve`.
+
+API examples:
+
+```bash
+curl -X POST http://127.0.0.1:8000/command \
+  -H "Content-Type: application/json" \
+  -d '{"input":"/git status"}'
+
+curl -X POST http://127.0.0.1:8000/command \
+  -H "Content-Type: application/json" \
+  -d '{"input":"/git push test message"}'
+
+curl -X POST http://127.0.0.1:8000/command/approve \
+  -H "Content-Type: application/json" \
+  -d '{"action":"git_branch","args":{"branch_name":"feature/test"}}'
+```
+
+## Local Coding Agent
+
+The local coding agent uses Ollama only. It sends bounded repo context from
+`~/agents` to `http://127.0.0.1:11434/api/chat` with the default model
+`qwen2.5-coder:7b`.
+
+Example:
+
+```bash
+curl "http://127.0.0.1:8000/coding/plan?request=make%20dashboard%20better"
+```
+
+This endpoint is planning-only and safe: it returns a summary, files to review,
+a proposed plan, risks, suggested tests, and one safe next command. It does not
+edit files, run project commands, or call OpenAI/Codex APIs.
 
 ## Notes
 
 - The backend assumes Ollama may be available locally at
   `http://127.0.0.1:11434`.
-- Ollama is not required for the current endpoints.
+- Ollama is required only for `/coding/plan`.
 - No external paid APIs are called.
 - The maintenance agent only suggests commands. It does not execute them.
 - The coding agent returns planning guidance only. It does not edit files.

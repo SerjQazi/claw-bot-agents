@@ -1,6 +1,7 @@
 """Simple intent router for local agents."""
 
 from .coding_agent import CodingAgent
+from .local_coding_agent import LocalCodingAgent
 from .maintenance_agent import MaintenanceAgent
 from .system_agent import SystemAgent
 
@@ -10,6 +11,7 @@ class AgentController:
         self.system_agent = SystemAgent()
         self.maintenance_agent = MaintenanceAgent()
         self.coding_agent = CodingAgent()
+        self.local_coding_agent = LocalCodingAgent()
 
     def list_agents(self) -> list[dict]:
         return [
@@ -37,8 +39,8 @@ class AgentController:
             return self.system_agent.handle(message)
         if normalized == "maintenance":
             return self.maintenance_agent.handle(message)
-        if normalized == "code":
-            return self.coding_agent.handle(message)
+        if normalized in {"coding", "code", "local_code", "plan"}:
+            return self.local_coding_agent.handle(message)
         if normalized == "chat":
             return {
                 "agent": "controller",
@@ -48,6 +50,14 @@ class AgentController:
 
         return {
             "agent": "controller",
-            "response": "Unknown intent. Use one of: system, maintenance, code, chat.",
-            "available_intents": ["system", "maintenance", "code", "chat"],
+            "response": "Unknown intent. Use one of: system, maintenance, coding, code, local_code, plan, chat.",
+            "available_intents": [
+                "system",
+                "maintenance",
+                "coding",
+                "code",
+                "local_code",
+                "plan",
+                "chat",
+            ],
         }
