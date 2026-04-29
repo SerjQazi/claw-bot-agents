@@ -63,6 +63,51 @@ curl -X POST http://127.0.0.1:8000/command/approve \
   -d '{"action":"git_branch","args":{"branch_name":"feature/test"}}'
 ```
 
+## System Watcher
+
+AgentOS starts a background `system_watcher` when the FastAPI app starts. It
+checks CPU, RAM, disk, load average, and uptime every 60 seconds with `psutil`,
+then stores heartbeat and warning events in an in-memory log buffer. It does not
+send Telegram messages or run shell commands.
+
+Warnings are logged when CPU or RAM exceed 85%, disk exceeds 90%, or the 1 minute
+load average is higher than the CPU core count.
+
+Watcher endpoints:
+
+```bash
+curl http://127.0.0.1:8000/agent-logs
+curl http://127.0.0.1:8000/agents/system_watcher/status
+curl -X POST http://127.0.0.1:8000/agents/system_watcher/start
+curl -X POST http://127.0.0.1:8000/agents/system_watcher/stop
+```
+
+The System Logs panel in `/control` reads from `/agent-logs`, and the
+`system_agent` Start/Stop button controls the watcher loop.
+
+## Self-Healing Agent
+
+AgentOS also starts `self_healing_agent` as a safe background monitor. It checks
+AgentOS internal health, Ollama availability at
+`http://127.0.0.1:11434/api/tags`, CPU, RAM, disk, and system load every 60
+seconds. It writes warnings and suggestions into the shared agent logs.
+
+Self-healing actions are not automatic. Recovery actions require explicit
+approval through the API and are allow-listed to:
+
+- `restart_ollama`
+- `restart_agentos`
+
+Endpoints:
+
+```bash
+curl http://127.0.0.1:8000/self-heal/status
+curl http://127.0.0.1:8000/self-heal/suggestions
+curl -X POST http://127.0.0.1:8000/self-heal/approve \
+  -H "Content-Type: application/json" \
+  -d '{"action":"restart_ollama"}'
+```
+
 ## Local Coding Agent
 
 The local coding agent uses Ollama only. It sends bounded repo context from

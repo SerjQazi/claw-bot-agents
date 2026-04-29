@@ -30,6 +30,11 @@ class AgentController:
                 "description": self.coding_agent.description,
                 "intents": ["code"],
             },
+            {
+                "name": "self_healing_agent",
+                "description": "Monitors AgentOS and safely suggests recovery actions.",
+                "intents": ["self_heal"],
+            },
         ]
 
     def route(self, intent: str, message: str = "") -> dict:

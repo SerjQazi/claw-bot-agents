@@ -11,10 +11,14 @@ from pydantic import BaseModel
 
 from agent_core.config import settings
 from agent_core.controller import AgentController
+from agent_core.self_healing_agent import SelfHealingAgent
+from agent_core.system_watcher import SystemWatcher
 
 
 app = FastAPI(title=settings.app_name)
 controller = AgentController()
+system_watcher = SystemWatcher()
+self_healing_agent = SelfHealingAgent()
 BASE_DIR = Path(__file__).resolve().parent
 GIT_HELPER = BASE_DIR / "scripts" / "git_helper.sh"
 BRANCH_NAME_RE = re.compile(r"^[A-Za-z0-9/_\.-]+$")
@@ -28,6 +32,22 @@ class CommandRequest(BaseModel):
 class CommandApprovalRequest(BaseModel):
     action: str
     args: dict[str, Any] = {}
+
+
+class SelfHealApprovalRequest(BaseModel):
+    action: str
+
+
+@app.on_event("startup")
+async def start_background_agents() -> None:
+    await system_watcher.start()
+    await self_healing_agent.start()
+
+
+@app.on_event("shutdown")
+async def stop_background_agents() -> None:
+    await self_healing_agent.stop()
+    await system_watcher.stop()
 
 
 def run_command(args: list[str]) -> dict:
@@ -198,6 +218,26 @@ def approve_command(action: str, args: dict[str, Any]) -> dict:
         "stdout": "",
         "stderr": f"Unsupported action: {action}",
     }
+
+
+def service_status(service_name: str) -> str:
+    try:
+        result = subprocess.run(
+            ["systemctl", "is-active", service_name],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return "unknown"
+
+    state = result.stdout.strip()
+    if result.returncode == 0 and state == "active":
+        return "running"
+    if state in {"inactive", "failed", "deactivating", "dead"}:
+        return "stopped"
+    return "unknown"
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1049,6 +1089,10 @@ def dashboard() -> str:
             align-items: baseline;
           }
 
+          .log-line.is-new {
+            animation: logFadeIn 260ms ease-out;
+          }
+
           .log-time {
             color: var(--soft);
           }
@@ -1059,6 +1103,35 @@ def dashboard() -> str:
 
           .log-message {
             color: var(--muted);
+          }
+
+          .log-line.warning .log-message,
+          .log-line.warning .log-level {
+            color: #facc15;
+          }
+
+          .log-line.error .log-message,
+          .log-line.error .log-level {
+            color: var(--danger);
+          }
+
+          .log-level {
+            display: inline-block;
+            min-width: 48px;
+            margin-right: 7px;
+            color: var(--soft);
+            font-size: 10px;
+            font-weight: 700;
+            letter-spacing: 0.06em;
+          }
+
+          @keyframes logFadeIn {
+            from {
+              opacity: 0;
+            }
+            to {
+              opacity: 1;
+            }
           }
 
           footer {
@@ -1185,7 +1258,18 @@ def dashboard() -> str:
         </style>
       </head>
       <body>
-        <main class="shell">
+        <div class="app-shell">
+          <aside class="sidebar" aria-label="Primary navigation">
+            <div class="brand"><span class="brand-mark">AO</span><span>AgentOS</span></div>
+            <nav class="side-nav">
+              <a class="nav-item active" href="/"><svg viewBox="0 0 24 24"><path d="M4 11l8-7 8 7"></path><path d="M6 10v10h12V10"></path></svg><span>Dashboard</span></a>
+              <a class="nav-item" href="/control"><svg viewBox="0 0 24 24"><path d="M12 3l7 4v6c0 4-3 7-7 8-4-1-7-4-7-8V7l7-4z"></path></svg><span>Control Panels</span></a>
+              <a class="nav-item" href="/commands"><svg viewBox="0 0 24 24"><path d="M4 7h16M7 7v10M17 7v10M4 17h16"></path></svg><span>Commands</span></a>
+              <a class="nav-item" href="/logs"><svg viewBox="0 0 24 24"><path d="M5 5h14v14H5z"></path><path d="M8 9h8M8 13h8M8 17h5"></path></svg><span>Logs</span></a>
+              <a class="nav-item" href="/settings"><svg viewBox="0 0 24 24"><path d="M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8z"></path><path d="M4 12h2M18 12h2M12 4v2M12 18v2"></path></svg><span>Settings</span></a>
+            </nav>
+          </aside>
+          <main class="shell main-panel">
           <header class="hero glass">
             <div>
               <h1>AgentOS</h1>
@@ -1347,7 +1431,7 @@ def dashboard() -> str:
           <section class="agents-panel glass" id="agents" aria-label="Available agents">
             <h2 class="agents-title"><span class="icon"><svg viewBox="0 0 24 24"><path d="M12 3l7 4v6c0 4-3 7-7 8-4-1-7-4-7-8V7l7-4z"></path><path d="M9 12h6M12 9v6"></path></svg></span>Available Agents</h2>
             <ul class="agent-list" id="agents-list">
-              <li><span class="icon"><svg viewBox="0 0 24 24"><path d="M12 3l7 4v6c0 4-3 7-7 8-4-1-7-4-7-8V7l7-4z"></path></svg></span><span class="agent-meta"><span class="agent-name"><span class="agent-status-dot"></span>Loading</span><span class="agent-description">Fetching local agent registry</span></span></li>
+              <li><span class="agent-meta"><span class="agent-description">Loading available agents...</span></span></li>
             </ul>
           </section>
 
@@ -1357,6 +1441,7 @@ def dashboard() -> str:
           </footer>
 
         </main>
+        </div>
 
         <script>
           const CIRCUMFERENCE = 364.42;
@@ -1460,13 +1545,16 @@ def dashboard() -> str:
           function setAgents(agents) {
             els.agentsList.innerHTML = "";
             if (!Array.isArray(agents) || agents.length === 0) {
-              els.agentsList.innerHTML = agentCardHtml("unknown_agent", "No agents returned by the local registry.");
+              els.agentsList.innerHTML = '<li><span class="agent-meta"><span class="agent-description">Unable to load available agents.</span></span></li>';
               return;
             }
             for (const agent of agents) {
+              if (!agent || !agent.name) {
+                continue;
+              }
               els.agentsList.insertAdjacentHTML(
                 "beforeend",
-                agentCardHtml(agent.name || "unknown_agent", agent.description || "Local agent available")
+                agentCardHtml(agent.name, agent.description || "Local agent available")
               );
             }
           }
@@ -1584,6 +1672,7 @@ def dashboard() -> str:
               els.statusPill.classList.add("offline");
               els.connectionStatus.textContent = "offline";
               els.lastUpdated.textContent = "Last updated: failed at " + new Date().toLocaleTimeString();
+              els.agentsList.innerHTML = '<li><span class="agent-meta"><span class="agent-description">Unable to load available agents.</span></span></li>';
             }
           }
 
@@ -2586,22 +2675,28 @@ def control_panel() -> str:
             <div class="brand"><span class="brand-mark">AO</span><span>AgentOS</span></div>
             <nav class="side-nav">
               <a class="nav-item" href="/"><svg viewBox="0 0 24 24"><path d="M4 11l8-7 8 7"></path><path d="M6 10v10h12V10"></path></svg><span>Dashboard</span></a>
-              <a class="nav-item active" href="#agents"><svg viewBox="0 0 24 24"><path d="M12 3l7 4v6c0 4-3 7-7 8-4-1-7-4-7-8V7l7-4z"></path></svg><span>Agents</span></a>
-              <a class="nav-item" href="#control-panel"><svg viewBox="0 0 24 24"><path d="M4 7h16M7 7v10M17 7v10M4 17h16"></path></svg><span>Command</span></a>
-              <a class="nav-item" href="#logs"><svg viewBox="0 0 24 24"><path d="M5 5h14v14H5z"></path><path d="M8 9h8M8 13h8M8 17h5"></path></svg><span>Logs</span></a>
+              <a class="nav-item active" href="/control"><svg viewBox="0 0 24 24"><path d="M12 3l7 4v6c0 4-3 7-7 8-4-1-7-4-7-8V7l7-4z"></path></svg><span>Control Panels</span></a>
+              <a class="nav-item" href="/commands"><svg viewBox="0 0 24 24"><path d="M4 7h16M7 7v10M17 7v10M4 17h16"></path></svg><span>Commands</span></a>
+              <a class="nav-item" href="/logs"><svg viewBox="0 0 24 24"><path d="M5 5h14v14H5z"></path><path d="M8 9h8M8 13h8M8 17h5"></path></svg><span>Logs</span></a>
+              <a class="nav-item" href="/settings"><svg viewBox="0 0 24 24"><path d="M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8z"></path><path d="M4 12h2M18 12h2M12 4v2M12 18v2"></path></svg><span>Settings</span></a>
             </nav>
           </aside>
 
           <main class="shell main-panel">
-          <div class="topbar">
-            <input class="top-command input" id="top-command-input" type="text" placeholder="Type a command..." autocomplete="off">
-            <div class="status-pill"><span class="dot"></span><span id="server-status">Online</span></div>
-          </div>
+          <section class="agents-panel glass" id="services" aria-label="System services">
+            <h2 class="agents-title"><span class="icon"><svg viewBox="0 0 24 24"><path d="M5 12h14"></path><path d="M12 5v14"></path></svg></span>System Services</h2>
+            <ul class="agent-list" id="services-list">
+              <li><span class="icon"><svg viewBox="0 0 24 24"><path d="M12 3l7 4v6c0 4-3 7-7 8-4-1-7-4-7-8V7l7-4z"></path></svg></span><span class="agent-meta"><span class="agent-name"><span class="agent-status-dot"></span>Loading</span><span class="agent-description">Checking local services</span></span><button class="button secondary" type="button">--</button></li>
+            </ul>
+          </section>
 
           <section class="agents-panel glass" id="agents" aria-label="Available agents">
             <h2 class="agents-title"><span class="icon"><svg viewBox="0 0 24 24"><path d="M12 3l7 4v6c0 4-3 7-7 8-4-1-7-4-7-8V7l7-4z"></path><path d="M9 12h6M12 9v6"></path></svg></span>Available Agents</h2>
             <ul class="agent-list" id="agents-list">
-              <li><span class="icon"><svg viewBox="0 0 24 24"><path d="M12 3l7 4v6c0 4-3 7-7 8-4-1-7-4-7-8V7l7-4z"></path></svg></span><span class="agent-meta"><span class="agent-name"><span class="agent-status-dot"></span>Loading</span><span class="agent-description">Fetching local agent registry</span></span><button class="button secondary" type="button">Start</button></li>
+              <li><span class="agent-meta"><span class="agent-description">Loading available agents...</span></span></li>
+            </ul>
+            <ul class="agent-list" id="self-heal-status-list">
+              <li><span class="icon"><svg viewBox="0 0 24 24"><path d="M12 3l7 4v6c0 4-3 7-7 8-4-1-7-4-7-8V7l7-4z"></path></svg></span><span class="agent-meta"><span class="agent-name"><span class="agent-status-dot"></span>self_healing_agent</span><span class="agent-description">Status: checking · Last check: -- · Suggestions: --</span></span></li>
             </ul>
           </section>
 
@@ -2623,6 +2718,9 @@ def control_panel() -> str:
               System Logs
             </div>
             <div class="log-stream" id="log-stream" role="log" aria-live="polite"></div>
+            <ul class="agent-list" id="self-heal-suggestions">
+              <li><span class="icon"><svg viewBox="0 0 24 24"><path d="M12 3l7 4v6c0 4-3 7-7 8-4-1-7-4-7-8V7l7-4z"></path></svg></span><span class="agent-meta"><span class="agent-name"><span class="agent-status-dot"></span>System healthy</span><span class="agent-description">System healthy. No actions required.</span></span></li>
+            </ul>
           </section>
 
           <footer>
@@ -2638,11 +2736,13 @@ def control_panel() -> str:
             serverStatus: document.getElementById("server-status"),
             statusPill: document.querySelector(".status-pill"),
             agentsList: document.getElementById("agents-list"),
-            topCommandInput: document.getElementById("top-command-input"),
             commandForm: document.getElementById("command-form"),
             commandInput: document.getElementById("command-input"),
             commandOutput: document.getElementById("command-output"),
             logStream: document.getElementById("log-stream"),
+            selfHealStatusList: document.getElementById("self-heal-status-list"),
+            selfHealSuggestions: document.getElementById("self-heal-suggestions"),
+            servicesList: document.getElementById("services-list"),
             lastUpdated: document.getElementById("last-updated"),
             connectionStatus: document.getElementById("connection-status"),
           };
@@ -2653,17 +2753,21 @@ def control_panel() -> str:
           ];
           const agentStates = {};
           let pendingApproval = null;
+          const seenLogKeys = new Set();
 
           function setAgents(agents) {
             els.agentsList.innerHTML = "";
             if (!Array.isArray(agents) || agents.length === 0) {
-              els.agentsList.innerHTML = agentCardHtml("unknown_agent", "No agents returned by the local registry.");
+              els.agentsList.innerHTML = '<li><span class="agent-meta"><span class="agent-description">Unable to load available agents.</span></span></li>';
               return;
             }
             for (const agent of agents) {
+              if (!agent || !agent.name) {
+                continue;
+              }
               els.agentsList.insertAdjacentHTML(
                 "beforeend",
-                agentCardHtml(agent.name || "unknown_agent", agent.description || "Local agent available")
+                agentCardHtml(agent.name, agent.description || "Local agent available")
               );
             }
           }
@@ -2695,20 +2799,199 @@ def control_panel() -> str:
             return '<svg viewBox="0 0 24 24"><path d="M12 3l7 4v6c0 4-3 7-7 8-4-1-7-4-7-8V7l7-4z"></path></svg>';
           }
 
-          function appendLog(source, message) {
-            logs.push({ source, message, time: new Date() });
-            if (logs.length > 40) {
+          function serviceDotClass(status) {
+            if (status === "running") {
+              return "";
+            }
+            if (status === "stopped") {
+              return ' style="background: var(--danger); box-shadow: 0 0 14px rgba(255, 99, 112, 0.7);"';
+            }
+            return ' style="background: #facc15; box-shadow: 0 0 14px rgba(250, 204, 21, 0.55);"';
+          }
+
+          function serviceActionButton(service) {
+            if (service.key === "ollama") {
+              return '<button class="button secondary service-action" type="button" data-action="restart_ollama">Restart</button>';
+            }
+            if (service.key === "agentos") {
+              return '<button class="button secondary service-action" type="button" data-action="restart_agentos">Restart</button>';
+            }
+            return '<button class="button secondary" type="button" disabled>Not installed</button>';
+          }
+
+          function renderServices(services) {
+            const items = Array.isArray(services) ? services : [];
+            if (items.length === 0) {
+              els.servicesList.innerHTML = '<li><span class="icon">' + agentIcon("system_agent") + '</span><span class="agent-meta"><span class="agent-name"><span class="agent-status-dot"></span>No services</span><span class="agent-description">No service status returned</span></span><button class="button secondary" type="button" disabled>--</button></li>';
+              return;
+            }
+
+            els.servicesList.innerHTML = items.map((service) => {
+              const status = service.status || "unknown";
+              return '<li><span class="icon">' + agentIcon("system_agent") + '</span><span class="agent-meta"><span class="agent-name"><span class="agent-status-dot"' + serviceDotClass(status) + '></span>' + escapeHtml(service.name || service.key || "Service") + '</span><span class="agent-description">Status: ' + escapeHtml(status) + '</span></span>' + serviceActionButton(service) + '</li>';
+            }).join("");
+          }
+
+          async function refreshServices() {
+            try {
+              const response = await fetch("/system/services", { cache: "no-store" });
+              if (!response.ok) {
+                throw new Error("Service request failed");
+              }
+              const data = await response.json();
+              renderServices(data.services);
+            } catch (error) {
+              appendLog("system_agent", "Service status refresh failed.", "error");
+            }
+          }
+
+          function appendLog(source, message, level = "info") {
+            logs.push({ source, message, level, time: new Date() });
+            if (logs.length > 50) {
               logs.shift();
             }
             renderLogs();
           }
 
+          function normalizeLogLevel(entry) {
+            const level = String(entry.level || "").toLowerCase();
+            if (level === "warning" || String(entry.message || "").startsWith("WARNING:")) {
+              return "warning";
+            }
+            if (level === "error" || String(entry.message || "").startsWith("ERROR:")) {
+              return "error";
+            }
+            return "info";
+          }
+
+          function formatLogTime(entry) {
+            const date = entry.time || (entry.timestamp ? new Date(entry.timestamp) : new Date());
+            if (Number.isNaN(date.getTime())) {
+              return new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+            }
+            return date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+          }
+
+          function logKey(entry) {
+            return [entry.timestamp || "", entry.source || "", entry.level || "", entry.message || ""].join("|");
+          }
+
           function renderLogs() {
             els.logStream.innerHTML = logs.map((entry) => {
-              const time = entry.time ? entry.time.toLocaleTimeString() : new Date().toLocaleTimeString();
-              return '<div class="log-line"><span class="log-time">' + escapeHtml(time) + '</span><span class="log-source">' + escapeHtml(entry.source) + '</span><span class="log-message">' + escapeHtml(entry.message) + '</span></div>';
+              const level = normalizeLogLevel(entry);
+              const key = logKey(entry);
+              const isNew = !seenLogKeys.has(key);
+              seenLogKeys.add(key);
+              return '<div class="log-line ' + level + (isNew ? ' is-new' : '') + '"><span class="log-time">' + escapeHtml(formatLogTime(entry)) + '</span><span class="log-source"><span class="log-level">' + level.toUpperCase() + '</span>' + escapeHtml(entry.source) + '</span><span class="log-message">' + escapeHtml(entry.message) + '</span></div>';
             }).join("");
             els.logStream.scrollTop = els.logStream.scrollHeight;
+          }
+
+          function setWatcherLogs(agentLogs) {
+            if (!Array.isArray(agentLogs)) {
+              return;
+            }
+            logs.length = 0;
+            for (const entry of agentLogs.slice(-50)) {
+              logs.push({
+                source: entry.source || "system_watcher",
+                level: normalizeLogLevel(entry),
+                message: entry.message || "",
+                timestamp: entry.timestamp,
+              });
+            }
+            renderLogs();
+          }
+
+          function formatSelfHealTime(value) {
+            if (!value) {
+              return "--";
+            }
+            const date = new Date(value);
+            if (Number.isNaN(date.getTime())) {
+              return "--";
+            }
+            return date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+          }
+
+          function renderSelfHealStatus(status) {
+            const running = Boolean(status && status.running);
+            const state = running ? "running" : "stopped";
+            const lastCheck = formatSelfHealTime(status && status.last_check);
+            const suggestionCount = status && Number.isFinite(Number(status.suggestion_count)) ? Number(status.suggestion_count) : 0;
+            els.selfHealStatusList.innerHTML =
+              '<li><span class="icon">' + agentIcon("self_healing_agent") + '</span><span class="agent-meta"><span class="agent-name"><span class="agent-status-dot"></span>self_healing_agent</span><span class="agent-description">Status: ' + escapeHtml(state) + ' · Last check: ' + escapeHtml(lastCheck) + ' · Suggestions: ' + suggestionCount + '</span></span></li>';
+          }
+
+          function renderSelfHealSuggestions(suggestions) {
+            const items = Array.isArray(suggestions) ? suggestions : [];
+            if (items.length === 0) {
+              els.selfHealSuggestions.innerHTML =
+                '<li><span class="icon">' + agentIcon("self_healing_agent") + '</span><span class="agent-meta"><span class="agent-name"><span class="agent-status-dot"></span>System healthy</span><span class="agent-description">System healthy. No actions required.</span></span></li>';
+              return;
+            }
+
+            els.selfHealSuggestions.innerHTML = items.map((suggestion) => {
+              const action = suggestion.suggested_action || "";
+              const actionText = action || suggestion.detail || "Review manually";
+              const approveButton = action ? '<button class="button secondary self-heal-approve" type="button" data-action="' + escapeHtml(action) + '">Approve</button>' : '';
+              return '<li><span class="icon">' + agentIcon("self_healing_agent") + '</span><span class="agent-meta"><span class="agent-name"><span class="agent-status-dot"></span>' + escapeHtml(suggestion.message || "Self-healing suggestion") + '</span><span class="agent-description">Recommended action: ' + escapeHtml(actionText) + '</span></span>' + approveButton + '</li>';
+            }).join("");
+          }
+
+          async function refreshLogs() {
+            try {
+              const response = await fetch("/agent-logs", { cache: "no-store" });
+              if (!response.ok) {
+                throw new Error("Log request failed");
+              }
+              const agentLogs = await response.json();
+              setWatcherLogs(agentLogs.logs);
+            } catch (error) {
+              appendLog("system_agent", "Log refresh failed.", "error");
+            }
+          }
+
+          async function refreshSelfHealing() {
+            try {
+              const [statusResponse, suggestionsResponse] = await Promise.all([
+                fetch("/self-heal/status", { cache: "no-store" }),
+                fetch("/self-heal/suggestions", { cache: "no-store" }),
+              ]);
+
+              if (!statusResponse.ok || !suggestionsResponse.ok) {
+                throw new Error("Self-heal request failed");
+              }
+
+              const status = await statusResponse.json();
+              const suggestions = await suggestionsResponse.json();
+              renderSelfHealStatus(status);
+              renderSelfHealSuggestions(suggestions.suggestions);
+            } catch (error) {
+              appendLog("self_healing_agent", "Self-healing refresh failed.", "error");
+            }
+          }
+
+          async function approveSelfHealAction(action) {
+            appendLog("self_healing_agent", "Approving self-heal action: " + action);
+            try {
+              const response = await fetch("/self-heal/approve", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ action }),
+              });
+
+              if (!response.ok) {
+                throw new Error("Self-heal approval failed");
+              }
+
+              const result = await response.json();
+              appendLog("self_healing_agent", "Self-heal action " + action + " exited with code " + result.exit_code + ".", result.exit_code === 0 ? "info" : "error");
+              refreshLogs();
+              refreshSelfHealing();
+            } catch (error) {
+              appendLog("self_healing_agent", "Self-heal approval failed.", "error");
+            }
           }
 
           function renderCommandResult(data) {
@@ -2795,30 +3078,34 @@ def control_panel() -> str:
 
           async function refreshControl() {
             try {
-              const [systemResponse, agentsResponse] = await Promise.all([
+              const [systemResponse, agentsResponse, logsResponse] = await Promise.all([
                 fetch("/system", { cache: "no-store" }),
                 fetch("/agents", { cache: "no-store" }),
+                fetch("/agent-logs", { cache: "no-store" }),
               ]);
 
-              if (!systemResponse.ok || !agentsResponse.ok) {
+              if (!systemResponse.ok || !agentsResponse.ok || !logsResponse.ok) {
                 throw new Error("Control request failed");
               }
 
               const system = await systemResponse.json();
               const agents = await agentsResponse.json();
+              const agentLogs = await logsResponse.json();
               const now = new Date();
 
               els.serverStatus.textContent = "Online";
               els.statusPill.classList.remove("offline");
               els.connectionStatus.textContent = "online";
+              agentStates.system_agent = Boolean(agentLogs.status && agentLogs.status.running);
               setAgents(agents.agents);
+              setWatcherLogs(agentLogs.logs);
               els.lastUpdated.textContent = "Last updated: " + now.toLocaleTimeString();
-              appendLog("system_agent", "Control heartbeat: " + (system.hostname || "local host") + ".");
             } catch (error) {
               els.serverStatus.textContent = "Offline";
               els.statusPill.classList.add("offline");
               els.connectionStatus.textContent = "offline";
               els.lastUpdated.textContent = "Last updated: failed at " + new Date().toLocaleTimeString();
+              els.agentsList.innerHTML = '<li><span class="agent-meta"><span class="agent-description">Unable to load available agents.</span></span></li>';
               appendLog("system_agent", "Control refresh failed.");
             }
           }
@@ -2840,20 +3127,50 @@ def control_panel() -> str:
             }
           });
 
-          els.topCommandInput.addEventListener("keydown", (event) => {
-            if (event.key === "Enter") {
-              event.preventDefault();
-              els.commandInput.value = els.topCommandInput.value;
-              submitCommand(els.topCommandInput.value);
+          els.selfHealSuggestions.addEventListener("click", (event) => {
+            const button = event.target.closest(".self-heal-approve");
+            if (!button) {
+              return;
             }
+            approveSelfHealAction(button.dataset.action);
           });
 
-          els.agentsList.addEventListener("click", (event) => {
+          els.servicesList.addEventListener("click", (event) => {
+            const button = event.target.closest(".service-action");
+            if (!button) {
+              return;
+            }
+            approveSelfHealAction(button.dataset.action);
+          });
+
+          els.agentsList.addEventListener("click", async (event) => {
             const button = event.target.closest(".agent-toggle");
             if (!button) {
               return;
             }
             const agentName = button.dataset.agent;
+            if (agentName === "system_agent") {
+              const nextAction = agentStates.system_agent ? "stop" : "start";
+              button.disabled = true;
+              try {
+                const response = await fetch("/agents/system_watcher/" + nextAction, {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                });
+                if (!response.ok) {
+                  throw new Error("Watcher request failed");
+                }
+                const status = await response.json();
+                agentStates.system_agent = Boolean(status.running);
+                button.textContent = agentStates.system_agent ? "Stop" : "Start";
+                appendLog("system_watcher", "system_watcher " + (agentStates.system_agent ? "started" : "stopped") + ".");
+              } catch (error) {
+                appendLog("system_watcher", "system_watcher control request failed.");
+              } finally {
+                button.disabled = false;
+              }
+              return;
+            }
             agentStates[agentName] = !agentStates[agentName];
             button.textContent = agentStates[agentName] ? "Stop" : "Start";
             appendLog("system_agent", agentName + " " + (agentStates[agentName] ? "started" : "stopped") + ".");
@@ -2861,12 +3178,564 @@ def control_panel() -> str:
 
           renderLogs();
           refreshControl();
+          refreshSelfHealing();
+          refreshServices();
+          setInterval(refreshLogs, 3000);
+          setInterval(refreshSelfHealing, 3000);
+          setInterval(refreshServices, 5000);
           setInterval(refreshControl, 5000);
         </script>
 
       </body>
     </html>
     """
+
+def app_sidebar(active: str) -> str:
+    items = [
+        ("dashboard", "/", "Dashboard", '<path d="M4 11l8-7 8 7"></path><path d="M6 10v10h12V10"></path>'),
+        ("control", "/control", "Control Panels", '<path d="M12 3l7 4v6c0 4-3 7-7 8-4-1-7-4-7-8V7l7-4z"></path>'),
+        ("commands", "/commands", "Commands", '<path d="M4 7h16M7 7v10M17 7v10M4 17h16"></path>'),
+        ("logs", "/logs", "Logs", '<path d="M5 5h14v14H5z"></path><path d="M8 9h8M8 13h8M8 17h5"></path>'),
+        ("settings", "/settings", "Settings", '<path d="M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8z"></path><path d="M4 12h2M18 12h2M12 4v2M12 18v2"></path>'),
+    ]
+    links = []
+    for key, href, label, icon in items:
+        class_name = "nav-item active" if key == active else "nav-item"
+        links.append(f'<a class="{class_name}" href="{href}"><svg viewBox="0 0 24 24">{icon}</svg><span>{label}</span></a>')
+    return (
+        '<aside class="sidebar" aria-label="Primary navigation">'
+        '<div class="brand"><span class="brand-mark">AO</span><span>AgentOS</span></div>'
+        '<nav class="side-nav">'
+        + "".join(links)
+        + "</nav></aside>"
+    )
+
+
+def app_view_html(title: str, active: str, content: str, script: str = "") -> str:
+    return """
+    <!doctype html>
+    <html lang="en">
+      <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>""" + title + """</title>
+        <style>
+          :root {
+            color-scheme: dark;
+            --bg: #050914;
+            --panel: rgba(12, 21, 37, 0.74);
+            --border: rgba(125, 211, 252, 0.2);
+            --border-strong: rgba(125, 211, 252, 0.42);
+            --text: #eef7ff;
+            --muted: #a8b7cc;
+            --soft: #6f8098;
+            --cyan: #00d4ff;
+            --blue: #6ecbff;
+            --green: #37d67a;
+            --danger: #ff6370;
+          }
+
+          * { box-sizing: border-box; }
+
+          body {
+            margin: 0;
+            min-height: 100vh;
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            background:
+              radial-gradient(circle at 12% 8%, rgba(64, 224, 208, 0.17), transparent 31%),
+              radial-gradient(circle at 88% 4%, rgba(106, 167, 255, 0.18), transparent 30%),
+              linear-gradient(145deg, #050914 0%, #08111f 52%, #0d1728 100%);
+            color: var(--text);
+          }
+
+          button,
+          input { font: inherit; }
+
+          .app-shell {
+            display: grid;
+            grid-template-columns: 220px minmax(0, 1fr);
+            min-height: 100vh;
+          }
+
+          .sidebar {
+            position: sticky;
+            top: 0;
+            height: 100vh;
+            padding: 18px 12px;
+            border-right: 1px solid rgba(110, 203, 255, 0.16);
+            background:
+              linear-gradient(180deg, rgba(255, 255, 255, 0.055), rgba(255, 255, 255, 0.018)),
+              rgba(5, 9, 20, 0.76);
+            box-shadow: 12px 0 36px rgba(0, 0, 0, 0.18);
+            backdrop-filter: blur(18px);
+          }
+
+          .brand {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 8px 10px 18px;
+            color: var(--text);
+            font-size: 18px;
+            font-weight: 600;
+          }
+
+          .brand-mark {
+            display: inline-grid;
+            place-items: center;
+            width: 34px;
+            height: 34px;
+            border: 1px solid rgba(0, 212, 255, 0.34);
+            border-radius: 10px;
+            background: rgba(0, 212, 255, 0.12);
+            box-shadow: 0 0 22px rgba(0, 212, 255, 0.14);
+          }
+
+          .side-nav {
+            display: grid;
+            gap: 5px;
+          }
+
+          .nav-item {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            min-height: 40px;
+            padding: 9px 10px;
+            border: 1px solid transparent;
+            border-radius: 10px;
+            color: var(--muted);
+            text-decoration: none;
+            font-size: 14px;
+            font-weight: 450;
+          }
+
+          .nav-item svg {
+            width: 17px;
+            height: 17px;
+            fill: none;
+            stroke: currentColor;
+            stroke-width: 1.9;
+            stroke-linecap: round;
+            stroke-linejoin: round;
+          }
+
+          .nav-item.active,
+          .nav-item:hover {
+            border-color: rgba(0, 212, 255, 0.24);
+            background: rgba(0, 212, 255, 0.09);
+            color: var(--text);
+          }
+
+          .shell {
+            width: min(1240px, 100%);
+            margin: 0 auto;
+            padding: 22px;
+            min-width: 0;
+          }
+
+          .glass {
+            position: relative;
+            overflow: hidden;
+            border: 1px solid var(--border);
+            border-radius: 17px;
+            background:
+              linear-gradient(180deg, rgba(255, 255, 255, 0.07), rgba(255, 255, 255, 0.025)),
+              var(--panel);
+            box-shadow: 0 14px 36px rgba(0, 0, 0, 0.26), inset 0 1px 0 rgba(255, 255, 255, 0.07);
+            backdrop-filter: blur(18px);
+          }
+
+          .command-card,
+          .logs-panel {
+            margin-bottom: 14px;
+            padding: 16px;
+          }
+
+          .card-header {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 14px;
+            color: var(--muted);
+            font-size: 13px;
+            font-weight: 600;
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+          }
+
+          .icon {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 28px;
+            height: 28px;
+            border: 1px solid rgba(125, 211, 252, 0.24);
+            border-radius: 8px;
+            background: rgba(96, 165, 250, 0.11);
+            color: #9bdcff;
+            flex: 0 0 auto;
+          }
+
+          .icon svg {
+            width: 16px;
+            height: 16px;
+            fill: none;
+            stroke: currentColor;
+            stroke-width: 1.9;
+            stroke-linecap: round;
+            stroke-linejoin: round;
+          }
+
+          .command-form {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) auto;
+            gap: 10px;
+            align-items: center;
+          }
+
+          .command-input {
+            width: 100%;
+            min-height: 52px;
+            border: 1px solid rgba(110, 203, 255, 0.2);
+            border-radius: 12px;
+            padding: 0 14px;
+            background: rgba(2, 6, 23, 0.48);
+            color: var(--text);
+            outline: none;
+          }
+
+          .button {
+            min-height: 42px;
+            border: 1px solid rgba(0, 212, 255, 0.38);
+            border-radius: 12px;
+            padding: 0 16px;
+            background:
+              linear-gradient(135deg, rgba(0, 212, 255, 0.28), rgba(255, 79, 216, 0.18)),
+              rgba(2, 6, 23, 0.52);
+            color: var(--text);
+            cursor: pointer;
+            font-weight: 550;
+            box-shadow: 0 0 20px rgba(0, 212, 255, 0.11);
+          }
+
+          .button.secondary {
+            min-height: 34px;
+            padding: 0 12px;
+            border-color: rgba(110, 203, 255, 0.22);
+            background: rgba(2, 6, 23, 0.34);
+            color: var(--muted);
+            font-size: 13px;
+          }
+
+          .command-output,
+          .examples {
+            margin-top: 12px;
+            padding: 12px;
+            border: 1px solid rgba(148, 163, 184, 0.14);
+            border-radius: 12px;
+            background: rgba(2, 6, 23, 0.36);
+            color: var(--muted);
+            font-size: 13px;
+            line-height: 1.45;
+            white-space: pre-wrap;
+          }
+
+          .log-stream {
+            display: grid;
+            gap: 8px;
+            max-height: calc(100vh - 145px);
+            overflow: auto;
+            padding: 12px;
+            border: 1px solid rgba(148, 163, 184, 0.13);
+            border-radius: 12px;
+            background: rgba(2, 6, 23, 0.34);
+            color: var(--muted);
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            font-size: 12px;
+            line-height: 1.55;
+          }
+
+          .log-line {
+            display: grid;
+            grid-template-columns: 96px 150px 86px 1fr;
+            gap: 12px;
+            align-items: baseline;
+          }
+
+          .log-time { color: var(--soft); }
+          .log-source { color: var(--blue); }
+          .log-level { color: var(--soft); font-weight: 700; }
+          .log-line.warning .log-level,
+          .log-line.warning .log-message { color: #facc15; }
+          .log-line.error .log-level,
+          .log-line.error .log-message { color: var(--danger); }
+
+          @media (max-width: 860px) {
+            .app-shell { grid-template-columns: 1fr; }
+            .sidebar {
+              position: sticky;
+              top: 0;
+              z-index: 9;
+              display: flex;
+              align-items: center;
+              gap: 10px;
+              height: auto;
+              padding: 10px;
+              overflow-x: auto;
+              border-right: 0;
+              border-bottom: 1px solid rgba(110, 203, 255, 0.16);
+            }
+            .brand { padding: 0 8px 0 0; white-space: nowrap; }
+            .side-nav { display: flex; gap: 6px; }
+            .nav-item { white-space: nowrap; }
+          }
+
+          @media (max-width: 520px) {
+            .command-form,
+            .log-line { grid-template-columns: 1fr; }
+            .shell { padding: 16px; }
+          }
+        </style>
+      </head>
+      <body>
+        <div class="app-shell">
+          """ + app_sidebar(active) + """
+          <main class="shell">
+            """ + content + """
+          </main>
+        </div>
+        """ + script + """
+      </body>
+    </html>
+    """
+
+
+@app.get("/commands", response_class=HTMLResponse)
+def commands_page() -> str:
+    content = """
+      <section class="command-card glass" aria-label="Command workspace">
+        <div class="card-header">
+          <span class="icon"><svg viewBox="0 0 24 24"><path d="M4 7h16M7 7v10M17 7v10M4 17h16"></path></svg></span>
+          Commands
+        </div>
+        <form class="command-form" id="command-form">
+          <input class="command-input" id="command-input" type="text" placeholder="Type a command..." autocomplete="off">
+          <button class="button" type="submit">Run</button>
+        </form>
+        <div class="examples" id="command-examples"><button class="button secondary" type="button" data-command="/system health">/system health</button> <button class="button secondary" type="button" data-command="/git status">/git status</button> <button class="button secondary" type="button" data-command="/git push message">/git push message</button> <button class="button secondary" type="button" data-command="/git branch feature/name">/git branch feature/name</button> <button class="button secondary" type="button" data-command="/code plan request">/code plan request</button></div>
+        <div class="command-output" id="command-output" aria-live="polite">Command response will appear here.</div>
+      </section>
+    """
+    script = """
+      <script>
+        const commandForm = document.getElementById("command-form");
+        const commandInput = document.getElementById("command-input");
+        const commandOutput = document.getElementById("command-output");
+        const commandExamples = document.getElementById("command-examples");
+        let pendingApproval = null;
+
+        function escapeHtml(value) {
+          return String(value)
+            .replaceAll("&", "&amp;")
+            .replaceAll("<", "&lt;")
+            .replaceAll(">", "&gt;")
+            .replaceAll('"', "&quot;")
+            .replaceAll("'", "&#039;");
+        }
+
+        function renderCommandResult(data) {
+          if (data && data.requires_approval) {
+            pendingApproval = { action: data.action, args: data.args || {} };
+            commandOutput.innerHTML =
+              '<div><strong>Approval required</strong></div>' +
+              '<div>Command: ' + escapeHtml(data.command_preview || "") + '</div>' +
+              '<div>Risk: ' + escapeHtml(data.risk || "Review before running.") + '</div>' +
+              '<div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:10px;">' +
+              '<button class="button secondary" type="button" data-command-action="approve">Approve</button>' +
+              '<button class="button secondary" type="button" data-command-action="cancel">Cancel</button>' +
+              '</div>';
+            return;
+          }
+          pendingApproval = null;
+          const agent = data && data.agent ? data.agent : "command_center";
+          const summary = data && data.response ? data.response : "Command completed.";
+          const status = data && Object.prototype.hasOwnProperty.call(data, "exit_code") ? (Number(data.exit_code) === 0 ? "success" : "failed") : "complete";
+          commandOutput.innerHTML =
+            '<div><strong>Agent:</strong> ' + escapeHtml(agent) + '</div>' +
+            '<div><strong>Summary:</strong> ' + escapeHtml(summary) + '</div>' +
+            '<div><strong>Status:</strong> ' + escapeHtml(status) + '</div>' +
+            '<details style="margin-top:10px;"><summary>Details</summary><pre style="white-space:pre-wrap; margin:10px 0 0;">' + escapeHtml(JSON.stringify(data, null, 2)) + '</pre></details>';
+        }
+
+        async function submitCommand(input) {
+          const command = input.trim();
+          if (!command) {
+            return;
+          }
+          commandOutput.textContent = "Running command...";
+          try {
+            const response = await fetch("/command", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ input: command }),
+            });
+            if (!response.ok) {
+              throw new Error("Command request failed");
+            }
+            renderCommandResult(await response.json());
+          } catch (error) {
+            pendingApproval = null;
+            commandOutput.textContent = "Command failed.";
+          }
+        }
+
+        async function approvePendingCommand() {
+          if (!pendingApproval) {
+            return;
+          }
+          commandOutput.textContent = "Running approved command...";
+          try {
+            const response = await fetch("/command/approve", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(pendingApproval),
+            });
+            if (!response.ok) {
+              throw new Error("Approval request failed");
+            }
+            pendingApproval = null;
+            commandOutput.textContent = JSON.stringify(await response.json(), null, 2);
+          } catch (error) {
+            pendingApproval = null;
+            commandOutput.textContent = "Approved command failed.";
+          }
+        }
+
+        commandExamples.addEventListener("click", (event) => {
+          const button = event.target.closest("button[data-command]");
+          if (!button) {
+            return;
+          }
+          commandInput.value = button.dataset.command;
+          submitCommand(button.dataset.command);
+        });
+
+        commandForm.addEventListener("submit", (event) => {
+          event.preventDefault();
+          submitCommand(commandInput.value);
+        });
+
+        commandOutput.addEventListener("click", (event) => {
+          const action = event.target.dataset.commandAction;
+          if (action === "approve") {
+            approvePendingCommand();
+          }
+          if (action === "cancel") {
+            pendingApproval = null;
+            commandOutput.textContent = "Command approval canceled.";
+          }
+        });
+      </script>
+    """
+    return app_view_html("AgentOS Commands", "commands", content, script)
+
+
+@app.get("/logs", response_class=HTMLResponse)
+def logs_page() -> str:
+    content = """
+      <section class="logs-panel glass" aria-label="System logs">
+        <div class="card-header">
+          <span class="icon"><svg viewBox="0 0 24 24"><path d="M5 5h14v14H5z"></path><path d="M8 9h8M8 13h8M8 17h5"></path></svg></span>
+          Logs
+        </div>
+        <div class="log-stream" id="log-stream" role="log" aria-live="polite"></div>
+      </section>
+    """
+    script = """
+      <script>
+        const logStream = document.getElementById("log-stream");
+
+        function escapeHtml(value) {
+          return String(value)
+            .replaceAll("&", "&amp;")
+            .replaceAll("<", "&lt;")
+            .replaceAll(">", "&gt;")
+            .replaceAll('"', "&quot;")
+            .replaceAll("'", "&#039;");
+        }
+
+        function normalizeLogLevel(entry) {
+          const level = String(entry.level || "").toLowerCase();
+          if (level === "warning" || String(entry.message || "").startsWith("WARNING:")) {
+            return "warning";
+          }
+          if (level === "error" || String(entry.message || "").startsWith("ERROR:")) {
+            return "error";
+          }
+          return "info";
+        }
+
+        function formatLogTime(value) {
+          const date = value ? new Date(value) : new Date();
+          if (Number.isNaN(date.getTime())) {
+            return new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+          }
+          return date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+        }
+
+        function renderLogs(logs) {
+          const entries = Array.isArray(logs) ? logs.slice(-50) : [];
+          if (entries.length === 0) {
+            logStream.innerHTML = '<div class="log-line"><span class="log-time">--</span><span class="log-source">system</span><span class="log-level">INFO</span><span class="log-message">No logs available.</span></div>';
+            return;
+          }
+          logStream.innerHTML = entries.map((entry) => {
+            const level = normalizeLogLevel(entry);
+            return '<div class="log-line ' + level + '"><span class="log-time">' + escapeHtml(formatLogTime(entry.timestamp)) + '</span><span class="log-source">' + escapeHtml(entry.source || "agent") + '</span><span class="log-level">' + level.toUpperCase() + '</span><span class="log-message">' + escapeHtml(entry.message || "") + '</span></div>';
+          }).join("");
+          logStream.scrollTop = logStream.scrollHeight;
+        }
+
+        async function refreshLogs() {
+          try {
+            const response = await fetch("/agent-logs?limit=50", { cache: "no-store" });
+            if (!response.ok) {
+              throw new Error("Log request failed");
+            }
+            const data = await response.json();
+            renderLogs(data.logs);
+          } catch (error) {
+            renderLogs([{ source: "logs", level: "error", message: "Log refresh failed.", timestamp: new Date().toISOString() }]);
+          }
+        }
+
+        refreshLogs();
+        setInterval(refreshLogs, 3000);
+      </script>
+    """
+    return app_view_html("AgentOS Logs", "logs", content, script)
+
+
+@app.get("/settings", response_class=HTMLResponse)
+def settings_page() -> str:
+    content = """
+      <section class="command-card glass" aria-label="Settings">
+        <div class="card-header">
+          <span class="icon"><svg viewBox="0 0 24 24"><path d="M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8z"></path><path d="M4 12h2M18 12h2M12 4v2M12 18v2"></path></svg></span>
+          Settings
+        </div>
+        <div class="command-output">Settings coming soon
+
+- notification settings
+- agent permissions
+- service thresholds
+- FiveM server path
+- theme preferences</div>
+      </section>
+    """
+    return app_view_html("AgentOS Settings", "settings", content)
+
 
 @app.get("/health")
 def health() -> dict:
@@ -2881,12 +3750,66 @@ def system() -> dict:
     return controller.system_agent.stats()
 
 
+@app.get("/system/services")
+def system_services() -> dict:
+    return {
+        "services": [
+            {"name": "Ollama", "key": "ollama", "status": service_status("ollama")},
+            {"name": "AgentOS", "key": "agentos", "status": service_status("agentos")},
+            {"name": "FiveM", "key": "fivem", "status": "stopped"},
+        ]
+    }
+
+
 @app.get("/agents")
 def agents() -> dict:
     return {
         "agents": controller.list_agents(),
-        "intents": ["system", "maintenance", "code", "chat"],
+        "intents": ["system", "maintenance", "code", "self_heal", "chat"],
     }
+
+
+@app.get("/agent-logs")
+def agent_logs(limit: int = 100) -> dict:
+    logs = system_watcher.recent_logs(limit=limit) + self_healing_agent.recent_logs(limit=limit)
+    logs.sort(key=lambda entry: entry.get("timestamp", ""))
+    return {
+        "logs": logs[-max(1, min(limit, 100)):],
+        "status": system_watcher.status(),
+    }
+
+
+@app.get("/agents/system_watcher/status")
+def system_watcher_status() -> dict:
+    return system_watcher.status()
+
+
+@app.post("/agents/system_watcher/start")
+async def start_system_watcher() -> dict:
+    return await system_watcher.start()
+
+
+@app.post("/agents/system_watcher/stop")
+async def stop_system_watcher() -> dict:
+    return await system_watcher.stop()
+
+
+@app.get("/self-heal/status")
+def self_heal_status() -> dict:
+    return self_healing_agent.status()
+
+
+@app.get("/self-heal/suggestions")
+def self_heal_suggestions() -> dict:
+    return {
+        "agent": self_healing_agent.name,
+        "suggestions": self_healing_agent.suggestions(),
+    }
+
+
+@app.post("/self-heal/approve")
+def self_heal_approve(payload: SelfHealApprovalRequest) -> dict:
+    return self_healing_agent.approve(payload.action)
 
 
 @app.post("/command")
