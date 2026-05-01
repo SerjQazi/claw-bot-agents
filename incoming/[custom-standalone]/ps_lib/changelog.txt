@@ -1,0 +1,58 @@
+Build: 0.5.0
+- initial release
+- please no major bugs, ill cry (im crying already)
+
+build: 0.5.1
+ - fix ps_lib's version check. Now goes to the proper git link to pull data
+ - Remove Success prints from startfirst/shared/locales
+ - `added` QB menu overwrite
+   - Use The Config Option To Turn It On, It will Take all qb-menu exports and convert
+   - To ps_lib context menu!
+   - `added` qb-input to auto convert to lib
+   
+- added ox arrays 
+- `seperated` ox zones and grids to seperate luas
+
+Build: 0.5.2
+- fix for input Ui not opening on second run
+- adjustment for ox zones
+- removed autoload locales ( was giving weird issues on qbx/esx but qb worked)
+- getSharedItem
+- getItemLabel
+- getItemWeight
+
+Build: 0.5.3
+  - reformated interactions.
+    - now checks your config for what you use and populates the necessary functions
+  - added support for mad_thoughts for notifications
+  - added new client inventory function `ps.getItemCount(item)`
+    - returns the total amount of the item you send through
+
+ 
+Build: 0.5.4
+  - moved a lot to bridge
+     - progressbars, menus, notifications, drawtext, zones
+  - removed ox_grids&Arrays&zones folder from modules
+  - built wrapper for ox zones and PolyZone
+  - fix small ox_inventory bugs for stashes
+  - added support for mad_thoughts and keep_progressbar
+
+Newest Build: 0.5.5
+  - added notification options
+    - okok, lation, paradise
+  - added inventory options
+    - tgg
+  - added Banking to bridge
+    - qb-banking, renewed-banking, okok banking
+  - added Vehicle Keys options
+    - MrNewb Vehicle Keys, qb
+  - Added Config Options Config.Inventory, Config.Target
+    - this allows you to load those modules before the scripts so load order is less
+    - of an issues
+  - added exports for most of the functions so you dont need to always load the entire
+    - lib
+  - added Lation Menus 
+  - added Lation Draw Text
+  - added "or 'en'" to the langs global in config in case the native doesnt do it properly 
+
+  
